@@ -4,7 +4,7 @@
 
 Revision 2 — reviewed and empirically validated, 2026-07-20. Supersedes the initial draft.
 
-This is the first of a sequence of derisking increments for an open-source multiplayer WWII air combat game project (working name: Ailbit Air Combat; repository: `github.com/liotier/BartElbitAirCombat`). This increment validates JSBSim integration in isolation. No networking, no rendering, no game logic.
+This is the first of a sequence of derisking increments for an open-source multiplayer WWII air combat game project (working name: BartElbitAirCombat; repository: `github.com/liotier/BartElbitAirCombat`). This increment validates JSBSim integration in isolation. No networking, no rendering, no game logic.
 
 Every numeric pass criterion in this revision was validated against an actual JSBSim v1.3.1 build (GCC 13.3, `-DCMAKE_BUILD_TYPE=Release`, x86-64 Linux) running the exact scenarios specified below. Measured reference values are given in Appendix B; the review that produced this revision is in `docs/increment-1-specification-review.md`.
 

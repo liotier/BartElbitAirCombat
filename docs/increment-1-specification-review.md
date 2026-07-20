@@ -64,7 +64,7 @@ JSBSim has no instrument model; IAS is defined as calibrated airspeed from `velo
 "At least four significant figures" gives ~111 m latitude resolution. Now fixed-point with ≥6 decimal places.
 
 ### F17 (minor) — Repository framing and project name
-The draft said "a fresh git repository"; the implementation target is this existing repository (`liotier/BartElbitAirCombat`, currently LICENSE-only), and the spec now says so. **Unresolved, for the project owner**: the draft's working name "Ailbit Air Combat" does not match the repository name "BartElbitAirCombat" — pick one and normalise it in the spec and future README.
+The draft said "a fresh git repository"; the implementation target is this existing repository (`liotier/BartElbitAirCombat`, currently LICENSE-only), and the spec now says so. The draft's working name "Ailbit Air Combat" did not match the repository name; resolved by normalising the working name to "BartElbitAirCombat" throughout.
 
 ### Verified as-is (no change)
 - Control sign conventions: elevator −1.0 = full aft (−28°, trailing edge up); aileron +1.0 = roll right. Draft was correct on both.
@@ -100,4 +100,3 @@ Escalate to Opus (or another frontier-tier model) only if: the implementation se
 
 1. **Upstream drift**: a future forced move off v1.3.1 could shift measured values; criteria margins (α: 19 %, energy: 36 %, roll timing: 2× window) were chosen to absorb point-release drift, but a re-validation run is cheap and recommended after any version change.
 2. **Runner variance**: GitHub-hosted runners are slower and occasionally flaky on network fetch; FetchContent hits GitHub once per clean build. If CI flakes, add a fetch retry or cache — permitted by the spec.
-3. **Naming** (F17) awaits an owner decision; cosmetic.
