@@ -16,18 +16,20 @@
 #include "csv_logger.h"
 
 #include <iomanip>
-#include <stdexcept>
 
 namespace inc1 {
 
-CsvLogger::CsvLogger(const std::string& path) : out_(path) {
+bool CsvLogger::open(const std::string& path, std::string& error) {
+    out_.open(path);
     if (!out_) {
-        throw std::runtime_error("failed to open CSV output file: " + path);
+        error = "failed to open CSV output file: " + path;
+        return false;
     }
     out_ << "time_s,lat_deg,lon_deg,alt_m,vel_north_mps,vel_east_mps,vel_down_mps,"
             "roll_deg,pitch_deg,yaw_deg,alpha_deg,beta_deg,ias_mps,tas_mps,"
             "elevator_norm,aileron_norm,rudder_norm,pitch_trim_norm,throttle_norm\n";
     out_ << std::fixed << std::setprecision(6);
+    return true;
 }
 
 void CsvLogger::writeRow(const FlightSample& s) {

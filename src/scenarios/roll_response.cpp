@@ -44,7 +44,12 @@ TestResult runRollResponse() {
         return result;
     }
 
-    CsvLogger logger("roll_response.csv");
+    CsvLogger logger;
+    if (!logger.open("roll_response.csv", error)) {
+        result.status = TestStatus::kError;
+        result.message = error;
+        return result;
+    }
     std::vector<FlightSample> samples = runLoop(
         session, 15.0,
         [](double t, FlightSession& s) {

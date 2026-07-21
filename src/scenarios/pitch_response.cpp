@@ -45,7 +45,12 @@ TestResult runPitchResponse() {
         return result;
     }
 
-    CsvLogger logger("pitch_response.csv");
+    CsvLogger logger;
+    if (!logger.open("pitch_response.csv", error)) {
+        result.status = TestStatus::kError;
+        result.message = error;
+        return result;
+    }
     std::vector<FlightSample> samples = runLoop(
         session, 30.0,
         [](double t, FlightSession& s) {

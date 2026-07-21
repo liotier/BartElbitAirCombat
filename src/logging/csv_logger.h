@@ -48,10 +48,15 @@ struct FlightSample {
 // order mandated by the specification's "Required columns" section.
 class CsvLogger {
 public:
-    explicit CsvLogger(const std::string& path);
+    CsvLogger() = default;
 
     CsvLogger(const CsvLogger&) = delete;
     CsvLogger& operator=(const CsvLogger&) = delete;
+
+    // Opens `path` and writes the header row. Returns false and fills
+    // `error` on failure; no other method may be called before this
+    // succeeds.
+    bool open(const std::string& path, std::string& error);
 
     void writeRow(const FlightSample& sample);
 

@@ -46,7 +46,12 @@ TestResult runPowerResponse() {
         return result;
     }
 
-    CsvLogger logger("power_response.csv");
+    CsvLogger logger;
+    if (!logger.open("power_response.csv", error)) {
+        result.status = TestStatus::kError;
+        result.message = error;
+        return result;
+    }
     std::vector<FlightSample> samples = runLoop(
         session, 60.0,
         [](double t, FlightSession& s) {
