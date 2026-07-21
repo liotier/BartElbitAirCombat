@@ -1,2 +1,19 @@
 /build/
 /results/
+/.godot-tools/
+/godot/bin/*.so
+
+# Editor "last opened with" bookkeeping - contains an absolute path to
+# whatever Godot executable last opened the project locally, not portable
+# across machines. Regenerated automatically the next time the project is
+# opened in an editor; unlike extension_list.cfg, not needed for the
+# GDExtension registration this directory is otherwise committed for.
+/godot/.godot/editor/project_metadata.cfg
+
+# c172x's own <output> block creates this during FGFDMExec::LoadModel(),
+# before FlightSession's DisableOutput() call can suppress it (increment 1
+# spec review finding F7). increment 1's standalone binary contains this by
+# chdir'ing into results/ first; the Godot GDExtension has no equivalent
+# controlled cwd (Godot's --path flag fixes it to the project directory),
+# so it is gitignored here instead.
+/godot/JSBout172B.csv

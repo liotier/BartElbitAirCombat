@@ -14,14 +14,16 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-# Orchestrates the increment-1 validation pipeline end to end, per
-# docs/increment-1-specification.md ("Test runner"). All pass/fail
-# evaluation happens inside the test binary; this script only configures,
-# builds, invokes it, and relays its exit status.
+# Orchestrates the full validation pipeline: increment 1's standalone suite
+# (docs/increment-1-specification.md, "Test runner"), then the five
+# Godot-driven tests (docs/increment-2-specification.md, "Test scenarios").
+# All pass/fail evaluation happens inside the test binary or the headless
+# test driver script; this script only configures, builds, fetches Godot,
+# invokes everything, and relays exit status.
 #
 # Exit codes: 0 all tests passed, 1 a test failed, 2 a required tool is
-# missing, 3 cmake configure failed, 4 the build failed, 5 the test binary
-# reported an execution error (e.g. trim did not converge).
+# missing, 3 cmake configure failed, 4 the build failed, 5 the increment 1
+# binary reported an execution error, 6 fetching the Godot editor failed.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,7 +33,15 @@ BUILD_DIR="build"
 RESULTS_DIR="results"
 TEST_BINARY="$BUILD_DIR/increment1_tests"
 
-for tool in cmake git; do
+# increment 2 spec, "Godot editor binary acquisition": fetched and cached by
+# this script, not installed by hand, and never built from source.
+GODOT_VERSION="4.5-stable"
+GODOT_ASSET="Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+GODOT_URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/${GODOT_ASSET}"
+GODOT_CACHE_DIR=".godot-tools"
+GODOT_BIN="$GODOT_CACHE_DIR/Godot_v${GODOT_VERSION}_linux.x86_64"
+
+for tool in cmake git curl unzip; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "error: required tool '$tool' not found on PATH" >&2
     exit 2
@@ -59,24 +69,52 @@ if ! cmake --build "$BUILD_DIR" --parallel "$NPROC"; then
   exit 4
 fi
 
+if [ ! -x "$GODOT_BIN" ]; then
+  echo "== Fetching Godot ${GODOT_VERSION} =="
+  mkdir -p "$GODOT_CACHE_DIR"
+  if ! curl -fsSL -o "$GODOT_CACHE_DIR/godot.zip" "$GODOT_URL"; then
+    echo "error: failed to download Godot editor from $GODOT_URL" >&2
+    echo "       verify the exact release asset name at https://github.com/godotengine/godot/releases" >&2
+    exit 6
+  fi
+  unzip -o -q "$GODOT_CACHE_DIR/godot.zip" -d "$GODOT_CACHE_DIR"
+  rm -f "$GODOT_CACHE_DIR/godot.zip"
+  chmod +x "$GODOT_BIN"
+fi
+
 rm -rf "$RESULTS_DIR"
 mkdir -p "$RESULTS_DIR"
 
-echo "== Running tests =="
+echo "== Running increment 1 tests =="
 set +e
 "$TEST_BINARY"
 BINARY_STATUS=$?
 set -e
 
 case "$BINARY_STATUS" in
-  0) exit 0 ;;
-  1) exit 1 ;;
+  0) ;;
   2)
-    echo "error: test binary reported an execution error" >&2
+    echo "error: increment 1 test binary reported an execution error" >&2
     exit 5
     ;;
-  *)
-    echo "error: test binary exited with unexpected status $BINARY_STATUS" >&2
-    exit 5
-    ;;
+  *) ;;
 esac
+
+echo "== Running Godot-driven tests =="
+GODOT_OVERALL_STATUS=0
+for scenario in trim_stability pitch_response roll_response power_response realtime_pacing; do
+  echo "-- $scenario --"
+  set +e
+  TEST_SCENARIO="$scenario" "$GODOT_BIN" --headless --path godot \
+    --scene res://scenes/headless_test.tscn
+  scenario_status=$?
+  set -e
+  if [ "$scenario_status" -ne 0 ]; then
+    GODOT_OVERALL_STATUS=1
+  fi
+done
+
+if [ "$BINARY_STATUS" -ne 0 ] || [ "$GODOT_OVERALL_STATUS" -ne 0 ]; then
+  exit 1
+fi
+exit 0

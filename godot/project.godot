@@ -1,0 +1,10 @@
+config_version=5
+
+[application]
+
+config/name="BartElbitAirCombat"
+run/main_scene="res://scenes/main.tscn"
+
+[physics]
+
+common/physics_ticks_per_second=120

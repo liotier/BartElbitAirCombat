@@ -9,13 +9,31 @@ on:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    # increment 2 spec, "CI timing": raised from increment 1's 10 minutes -
+    # the godot-cpp compile alone measured ~5 minutes on a cold cache.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake build-essential git
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential git curl unzip
 
-      - name: Run increment 1 test suite
+      # increment 2 spec, "CI timing": build caching is required at this
+      # increment's scale, not merely permitted as in increment 1 - without
+      # it every push repays the full godot-cpp/JSBSim compile.
+      - name: Cache CMake build directory
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: ${{ runner.os }}-cmake-build-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Cache Godot editor binary
+        uses: actions/cache@v4
+        with:
+          path: .godot-tools
+          key: ${{ runner.os }}-godot-bin-${{ hashFiles('scripts/run_tests.sh') }}
+
+      - name: Run full test suite
         run: ./scripts/run_tests.sh
 
       - name: Upload results

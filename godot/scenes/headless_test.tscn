@@ -1,0 +1,8 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/headless_test_driver.gd" id="1"]
+
+[node name="HeadlessTest" type="Node"]
+script = ExtResource("1")
+
+[node name="FlightAircraft" type="FlightAircraft" parent="."]
