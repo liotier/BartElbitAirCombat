@@ -2,14 +2,16 @@
 
 ## Status
 
-Draft, informed by empirical validation performed ahead of drafting (Appendix B). This is increment 3 of the derisking sequence in `docs/roadmap.md`. It builds on increments 1 and 2: the `FlightSession` abstraction, `flightcore` library, the c172x aircraft, and the four validated flight-dynamics scenarios are reused, not reimplemented.
+Revision 2 — reviewed. Supersedes draft 1; the adversarial review that produced this revision is in `docs/increment-3-specification-review.md`, which justifies the test-architecture and impairment changes below finding by finding. This is increment 3 of the derisking sequence in `docs/roadmap.md`. It builds on increments 1 and 2: the `FlightSession` abstraction, `flightcore` library, the c172x aircraft, and the four validated flight-dynamics scenarios are reused, not reimplemented.
 
-Before this specification was written, the following were verified by building and running real code (details and measured numbers in Appendix B):
+Before draft 1 was written, the following were verified by building and running real code (details and measured numbers in Appendix B):
 
 - ENet v1.3.18 fetches and builds cleanly via CMake FetchContent alongside the existing JSBSim and godot-cpp dependencies; the ENet API used below compiles as written.
 - Localhost UDP works in a restricted sandbox; a full ENet connection establishes and passes both reliable and unreliable packets each direction, with a measured localhost round-trip of tens of microseconds.
 - Our own statically-linked ENet, compiled into a GDExtension and loaded into a running Godot process, connects to a standalone Godot-free C++ ENet server and round-trips a packet — proving no symbol collision with Godot's own bundled ENet, which was the single riskiest architectural assumption.
-- Kernel-level network impairment (`tc`/`netem`) is unavailable in the sandbox, so latency/loss testing must be done with an in-process impairment layer. This specification turns that constraint into a designed, first-class testing feature rather than a workaround.
+- Kernel-level network impairment (`tc`/`netem`) is unavailable in the sandbox, so latency/loss testing uses a userspace UDP relay proxy (see "Network impairment").
+
+The review then reshaped how this increment is *tested*: because the server runs the identical `FlightSession`, the network layer cannot alter the physics, so re-verifying flight dynamics over the wire proves little and risks false greens on serialization bugs. The tests below instead assert **transport fidelity** (client-received state compared field-by-field against server-authoritative state), **physics preservation** (increment 1 criteria evaluated server-side where the full state exists), and the **input path** (client-sent input demonstrably changing server state) — the three things the network layer can actually get wrong.
 
 ## Goal
 
@@ -42,14 +44,14 @@ Builds on increments 1–2. New and changed paths:
 ├── src/
 │   ├── ... (increments 1-2 unchanged)
 │   ├── netcore/                        (new: Godot-free networking core)
-│   │   ├── protocol.h / protocol.cpp       (message types, wire (de)serialization)
+│   │   ├── protocol.h / protocol.cpp       (message types, field-by-field wire (de)serialization)
 │   │   ├── net_server.h / net_server.cpp   (ENet server host wrapper)
-│   │   ├── net_client.h / net_client.cpp   (ENet client host wrapper)
-│   │   └── impairment.h / impairment.cpp   (in-process latency/loss injection, testing only)
+│   │   └── net_client.h / net_client.cpp   (ENet client host wrapper)
 │   ├── server/
-│   │   └── main.cpp                    (new: the flight_server binary)
+│   │   └── main.cpp                    (new: the flight_server binary — networked + scripted-scenario modes)
 │   ├── net_test/
-│   │   └── main.cpp                    (new: the flight_test_client binary — scripted, criteria-evaluating)
+│   │   ├── main.cpp                    (new: the flight_test_client binary — fidelity + input-path harness)
+│   │   └── net_relay.cpp               (new: userspace UDP relay proxy for latency/loss testing)
 │   └── godot_ext/
 │       ├── ... (increment 2 unchanged)
 │       ├── network_client.h / .cpp     (new: NetworkClient node — connects, sends input, receives snapshots)
@@ -96,7 +98,7 @@ Godot bundles its own copy of ENet internally. Our server and client both static
 
 Three executables/libraries, layered so the wire format is defined exactly once and shared by every participant:
 
-- **`netcore`** — a static C++ library depending **only on ENet** (not on JSBSim, flightcore, or Godot). It defines the message types, their little-endian wire (de)serialization, thin server/client ENet host wrappers, and the testing impairment layer. Keeping it dependency-light makes it independently testable and guarantees the server and client speak byte-identical wire format because they compile the *same* serialization code.
+- **`netcore`** — a static C++ library depending **only on ENet** (not on JSBSim, flightcore, or Godot). It defines the message types, their little-endian field-by-field wire (de)serialization, and thin server/client ENet host wrappers. Keeping it dependency-light makes it independently testable and guarantees the server and client speak byte-identical wire format because they compile the *same* serialization code. (Network impairment for testing lives in the separate `net_relay` proxy, not in `netcore` — see "Network impairment".)
 - **`flight_server`** — a standalone C++ binary (no Godot) linking `flightcore` + `netcore`. Owns the authoritative `FlightSession`, runs it at a wall-clock-paced 120 Hz, applies received client inputs, and broadcasts state snapshots at a configurable lower rate.
 - **The client** exists in two forms that share `netcore` and therefore the identical protocol:
   - **`flight_test_client`** — a standalone C++ binary (no Godot) linking `netcore`, used for automated testing. It connects, sends a *scripted* control-input schedule (increment 1's scenarios), collects received snapshots, and evaluates increment 1's pass criteria in C++. This is increment 3's analogue of increment 1's `increment1_tests` binary: headless, deterministic, fast, CI-friendly.
@@ -134,10 +136,12 @@ Field-width discipline, applied from this increment even though one client exerc
 | 6 | `ClientBye` | C→S | 0 | reliable | (empty) |
 
 Notes:
-- The `StateSnapshot` carries an `aircraft_count` and a per-aircraft list even though increment 3 always sends exactly one. This is the deliberate "server decides what this client needs to know" shape: the server builds each client's snapshot from a per-client set of relevant aircraft. In increment 3 that set is trivially {the one aircraft}; increment 4+ makes the set selection smarter without changing the message structure.
+- The `StateSnapshot` carries an `aircraft_count` and a per-aircraft list even though increment 3 always sends exactly one. This is the deliberate "server decides what this client needs to know" shape: the server builds each client's snapshot from a per-client set of relevant aircraft. In increment 3 that set is trivially {the one aircraft}; increment 4+ makes the set selection smarter without changing the per-aircraft *record layout*. (The *packetisation* will change: at scale, 128 aircraft × ~45 B ≈ 5.7 KB exceeds a safe ~1400 B UDP datagram, so snapshots will be split across multiple datagrams — a known increment-4 concern, not a claim that the wire structure is final.)
 - `pos_local_m` is in the same local East-Up-(−North) frame `computeAircraftTransform()` already uses (increment 2), relative to the session origin the server announces in `ServerWelcome`. The client feeds these straight into the validated transform function.
 - Control channel (1) is unreliable: latest input wins, and a dropped input packet simply means the server holds the previous input one more tick — correct behaviour, no reliability needed. The `client_seq` lets the server ignore out-of-order stale inputs.
 - Handshake/teardown (channel 0) is reliable and ordered.
+- **Serialization is field-by-field** into a byte buffer, in the order and widths tabulated above. No packed struct is `memcpy`'d to or from the wire — that would reintroduce the compiler-padding and host-endianness dependence the little-endian discipline exists to remove.
+- `origin_lat/lon` are `float32` (~1 m resolution at temperate latitudes). Harmless here because positions travel as *local* offsets from the origin and the increment-3 origin is (0,0); if absolute georeferencing is ever needed, widen the origin to `float64` (local offsets stay `float32`).
 
 ### Rates (all configurable; stated defaults)
 
@@ -153,25 +157,24 @@ A standalone binary. Responsibilities:
 2. Create an ENet server host. Initialize one authoritative `FlightSession` (the c172x, initialized and trimmed exactly per increment 1's sequence — the same 5000 ft / 100 kt or scenario-specific initial condition).
 3. Run a **wall-clock-paced fixed-timestep loop** at 120 Hz: accumulate elapsed real time, step the `FlightSession` as many 120 Hz ticks as have elapsed (with a sane maximum catch-up per wake to avoid a spiral of death — the standalone equivalent of the cap Godot applies internally, which increment 2 measured), sleeping the remainder. On each tick, apply the most-recently-received `ControlInput` for the connected client. Every N ticks (per snapshot rate), broadcast a `StateSnapshot`.
 4. Service ENet: accept a `ClientHello` (version-check → `ServerWelcome` or `ServerReject`), receive `ControlInput`, handle `ClientBye`/timeout disconnect cleanly.
-5. Optionally (scripted-scenario mode, for automated tests) *ignore* network input and instead apply a built-in scripted input schedule to its own `FlightSession`, while still broadcasting snapshots — this lets a test verify the pure server→client streaming path in isolation. The default mode applies network-received input (the full loop).
-6. Optionally log the authoritative trajectory to `results/server_<scenario>.csv` (increment 1 schema) for direct comparison against what the client received.
+5. In **scripted-scenario mode** (used by the physics-preservation test), apply a built-in scripted input schedule to its own `FlightSession` — increment 1's scenarios, at exact sim-ticks (t=5 s = tick 600) so the trajectory reproduces increment 1 deterministically — while still broadcasting snapshots. In the default **networked mode** it applies network-received input (the full loop). Which mode is active is a config flag.
+6. **Log every broadcast snapshot** to `results/server_<scenario>.csv` (the exact bytes it sent, decoded to the snapshot fields, keyed by `server_tick`). This is not optional: it is the reference the client's received log is compared against for the transport-fidelity test.
+7. In scripted-scenario mode, **evaluate increment 1's pass criteria server-side** against its own full `FlightSample` at 120 Hz — exactly as `increment1_tests` does, reusing that code via `flightcore` — and report the result. This is where physics preservation is asserted, because the server has every quantity JSBSim produces (altitude, IAS, α, …) directly, with no derivation.
 
-Exit codes mirror increments 1–2 conventions (0 clean, non-zero on init/bind/trim failure).
+Exit codes mirror increments 1–2 conventions (0 clean, 1 a criterion/assertion failed, 2 init/bind/trim execution error).
 
 ## Clients
 
 ### `flight_test_client` (automated)
 
-A standalone binary. For a given scenario (selected by env var / flag, reusing increment 1's four scenario names), it:
+A standalone binary linking `netcore` (Godot-free). It is the harness for the three network-specific assertions. Time is always measured from `server_tick` carried in snapshots (the authoritative timeline), and the scenario clock anchors to the reliable `ServerWelcome`, never to an unreliable first snapshot — so criterion timing and input scheduling are robust to snapshot loss.
 
-1. Connects to `flight_server` on localhost, completes the handshake.
-2. Runs its own 60 Hz input loop, sending the scenario's scripted `ControlInput` schedule (e.g. `pitch_response` → elevator −1.0 from t≥5 s). Time is measured from the handshake / first snapshot.
-3. Collects every received `StateSnapshot`, converting each to the increment-1 quantities (altitude, IAS, pitch, bank, α, etc. — derived from the snapshot's position/quaternion/velocity, plus any fields added as needed).
-4. On completion, evaluates increment 1's exact pass criteria for that scenario against the received trajectory and exits 0/1 accordingly, printing the same criterion-by-criterion breakdown style as increments 1–2.
+The client does **not** re-derive physics quantities to check physics criteria (that is done server-side; see B1 in the review). Its jobs are:
 
-Because localhost RTT is negligible (Appendix B) and the scripted inputs are step functions, the received trajectory is expected to reproduce increment 1's physics within the same comfortable margins increment 2 achieved — with one documented nuance: input is applied at the server on snapshot/input-rate granularity, so a "t≥5 s" transition may land within ±1 input-tick of t=5 s. Increment 1's criterion windows ([5,10] s etc.) absorb this comfortably.
+- **Transport fidelity**: log every received `StateSnapshot` (fields, keyed by `server_tick`). A comparison step then asserts, field-by-field, that the client's received log matches the server's sent log (`results/server_<scenario>.csv`) within float32 tolerance. This catches any serialization, endianness, axis-mapping or fixed-point bug exactly, because it compares the same representation on both ends rather than laundering it through loose physics criteria. This is the primary correctness test of the increment.
+- **Input path** (required, full-loop): in networked mode, the client sends a scripted `ControlInput` (e.g. nose-up from server-tick ≥ some t) and the test asserts the server's authoritative state — as seen in the received snapshots — responds (e.g. pitch rises through a threshold within a bounded time after the input). This proves the client→server input path, the authority direction the increment exists to validate. It uses a short duration, not a full flight scenario.
 
-Note on airspeed: the snapshot carries velocity but not JSBSim's calibrated-airspeed instrument value directly. The client derives true airspeed from the velocity vector; where a criterion is specified on indicated/calibrated airspeed, either (a) add an `ias` field to the snapshot, or (b) evaluate that criterion against true airspeed with the small documented IAS/TAS difference at 5000 ft folded into the tolerance. The implementer chooses; if (a), keep the field `int16` fixed-point (knots × 100) per the width discipline.
+Airspeed/α on the wire: the automated tests do not need them (physics criteria are server-side). The snapshot therefore stays the compact rigid-body record above. If the *Godot* client later wants airspeed for a HUD, adding a fixed-point `ias` field (knots × 100, `int16`) is a clean forward step — deferred to UI work, not needed here.
 
 ### Godot client (`NetworkClient` + `RemoteAircraft`, human-facing)
 
@@ -182,27 +185,30 @@ Note on airspeed: the snapshot carries velocity but not JSBSim's calibrated-airs
 
 The Godot client is validated **manually** (a human starts a server, presses Play, flies it, confirms it responds with correct sign conventions and visibly-authoritative behaviour), consistent with increment 2's manual criterion. Its underlying transport path is covered automatically by `flight_test_client` (same `netcore`) and was de-risked by the pre-drafting runtime probe.
 
-## In-process impairment layer (testing)
+## Network impairment (testing)
 
-Because `tc`/`netem` is unavailable in the target sandbox (Appendix B), `netcore` includes an optional impairment layer, enabled only via explicit config (off in production): outgoing (and/or incoming) packets are held in a small queue stamped with a release time (added latency) and dropped with a configurable probability (loss). This is *better* than kernel netem for automated testing because it is deterministic and reproducible with a seeded RNG.
+`tc`/`netem` is unavailable in the target sandbox (Appendix B), and — more importantly — an application-level delay/drop queue would sit *above* ENet, so ENet's own reliability, retransmit, RTT and congestion logic would run on the real fast link and never see the impairment. That tests only the application's tolerance to delayed/dropped messages, not the transport's behaviour under an adverse network, which is a stated reason for choosing ENet.
 
-It supports two required automated tests:
+The faithful mechanism, and the one the resilience acceptance criteria are evaluated against, is a **userspace UDP relay proxy** (`net_relay`, part of `netcore`/tools): a small process that listens on a local port, forwards datagrams to the server and back, and applies a configurable one-way delay and drop probability (seeded RNG, reproducible) to the *actual datagram stream*. The client connects to the relay instead of the server; ENet then sees real impaired UDP and reacts correctly. This needs no `NET_ADMIN` — it is ordinary userspace forwarding — and is directly reusable for increment 4's prediction testing.
 
-- **Latency resilience**: with, e.g., 100 ms of added one-way delay, the full loop still functions and the connection stays up. (The scripted-scenario trajectory will shift in time by the delay; this test asserts connection liveness, snapshot flow, and absence of NaN/divergence — *not* exact increment-1 criteria, which are asserted only on the clean-localhost run.)
-- **Loss resilience**: with, e.g., 20% loss on the unreliable channels, the client still tracks the aircraft (each snapshot is absolute state, so loss reduces update rate but cannot accumulate error), reliable handshake/teardown still complete, and no divergence/NaN occurs.
+Required automated tests, run through the relay:
 
-This layer is also the groundwork increment 4 needs to test prediction/reconciliation under controlled impairment.
+- **Latency resilience**: with, e.g., 100 ms one-way delay, the full loop still functions, the connection stays up, snapshots keep flowing, and no NaN/divergence occurs. (Trajectory timing shifts by the delay; this asserts liveness and flow, not exact increment-1 criteria — those are asserted server-side on the clean run.)
+- **Loss resilience**: with, e.g., 20% drop, the client still tracks the aircraft (each snapshot is absolute state, so loss reduces update rate but cannot accumulate error), the *reliable* handshake/teardown still complete despite drops on the same impaired link (this is the test that actually exercises ENet's retransmit — impossible with an above-ENet queue), and no divergence/NaN occurs.
 
 ## Test runner and CI
 
-`scripts/run_tests.sh` gains a third phase after increments 1 (standalone) and 2 (Godot), all of which must still pass:
+`scripts/run_tests.sh` gains a third phase after increments 1 (standalone) and 2 (Godot), all of which must still pass. The increment-3 tests are deliberately network-specific rather than a re-run of all four flight scenarios: the network cannot alter the physics (the server runs the identical `FlightSession`), so the risks worth testing are serialization, the input path, and resilience — not stall behaviour over a socket. The phase runs:
 
-1. Build everything (adds `netcore`, `flight_server`, `flight_test_client`; `flight_gdext` now also links `netcore`).
-2. For each of the four reused scenarios: start `flight_server` (background, clean localhost), run `flight_test_client` for that scenario, collect its exit code, stop the server.
-3. Run the protocol tests: connect/handshake/version-mismatch-rejection/clean-disconnect; latency-resilience; loss-resilience.
-4. Overall exit 0 only if increments 1–2 suites *and* every increment-3 scenario and protocol test pass.
+1. Build everything (adds `netcore`, `flight_server`, `flight_test_client`, `net_relay`; `flight_gdext` now also links `netcore`).
+2. **Physics preservation (one scenario, server-side)**: start `flight_server` in scripted-scenario mode for a single scenario (e.g. `pitch_response`), which evaluates increment 1's criteria against its own full `FlightSample` and logs its sent snapshots. This validates the server's new wall-clock-paced loop produces a correct trajectory. Runs at wall-clock pace (~30 s for one scenario).
+3. **Transport fidelity**: `flight_test_client` connects (clean localhost), logs received snapshots, and a comparison asserts them field-by-field against the server's sent log within float32 tolerance.
+4. **Input path (full-loop, required)**: short test — client sends a scripted input, assert the server's received-snapshot state responds within a bounded time.
+5. **Protocol**: handshake, version-mismatch rejection, clean disconnect.
+6. **Resilience (through `net_relay`)**: latency and loss tests.
+7. Overall exit 0 only if increments 1–2 suites *and* every increment-3 assertion pass.
 
-Each server+client scenario runs at wall-clock pace (the server is real-time-paced), so the four reused scenarios take ~165 s combined, as in increment 2. The protocol tests are short. Combined with the (cached) builds this stays within the **20-minute** CI budget carried over from increment 2; build caching remains required. The Godot client's manual validation is not part of CI.
+Only the single physics-preservation scenario runs at full wall-clock duration; the rest are short. Combined with the (cached) builds this stays comfortably within the **20-minute** CI budget carried over from increment 2; build caching remains required. The Godot client's manual validation is not part of CI.
 
 Server and client are separate processes talking over localhost UDP — confirmed to work in the CI-like sandbox (Appendix B). The runner must start the server before the client and guarantee it is torn down afterward (trap/kill), and should use a fixed or per-run-unique port to avoid collisions.
 
@@ -218,8 +224,8 @@ Unchanged: GPL-3.0-or-later for this project. ENet is MIT-licensed (compatible),
 
 Increment 3 is complete when all hold simultaneously:
 
-1. `scripts/run_tests.sh` on a fresh clone (clean Debian 12 / Ubuntu 24.04) exits 0 — increments 1–2 suites unchanged, all four reused scenarios pass over the network loop, and all protocol tests (handshake, version-rejection, disconnect, latency-resilience, loss-resilience) pass.
-2. The four reused scenarios' received trajectories satisfy increment 1's pass criteria, demonstrating the networked authoritative loop reproduces the validated physics.
+1. `scripts/run_tests.sh` on a fresh clone (clean Debian 12 / Ubuntu 24.04) exits 0 — increments 1–2 suites unchanged, and every increment-3 assertion passes: physics-preservation (one scenario, server-side, increment 1 criteria), transport-fidelity (client-received matches server-sent field-by-field), input-path (client input changes server state), protocol (handshake, version-rejection, disconnect), and resilience through `net_relay` (latency, loss).
+2. The transport-fidelity comparison passes — the client received byte-faithful state — and the server-side physics-preservation scenario satisfies increment 1's criteria, so both the transport and the server's real-time loop are proven correct.
 3. A human has started `flight_server`, connected the Godot client (`networked.tscn`), flown the placeholder aircraft with the keyboard, and confirmed correct, visibly server-authoritative response — documented as performed (not CI-gated), as in increment 2.
 4. The GitHub Actions workflow runs to completion successfully on push within the 20-minute budget.
 5. The README is sufficient for a competent developer to build, run the server, connect a client, and run the tests without additional explanation.
@@ -230,13 +236,13 @@ Everything in increments 1–2 deferred lists, plus: client-side prediction / re
 
 ## Open questions for the implementer
 
-At the implementer's discretion; document the choice:
+At the implementer's discretion; document the choice. (Note: the input-path test is **not** optional — it is a required acceptance criterion; only the items below are open.)
 
-- Whether to add an explicit `ias` field to `StateSnapshot` or derive airspeed client-side from velocity (see `flight_test_client` note).
-- Whether the four automated networked scenarios drive input from the client (full-loop test, preferred) or use the server's scripted-scenario mode (streaming-only test) — or both.
 - The exact server catch-up cap per wake, and whether to use `enet_host_service` timeouts or a separate sleep for pacing.
 - Whether `RemoteAircraft` and `FlightAircraft` (increment 2) share a base class or stay separate (they diverge: one steps a sim, one applies snapshots).
-- Impairment RNG seed handling for reproducible CI.
+- `net_relay` implementation shape (separate process vs. thread) and its RNG seed handling for reproducible CI.
+- The float32 tolerance used by the transport-fidelity comparison (must be tight enough to catch a real bug, loose enough to absorb float32 round-trip — the measured quaternion round-trip error of ~0.003° and metre-scale position round-trip suggest a tolerance well under any physically meaningful error).
+- Whether `flight_server` runs scripted-scenario mode as a distinct binary mode or a separate small harness reusing its loop.
 
 ---
 
@@ -267,5 +273,6 @@ Measured on a 4-core x86-64 container, Ubuntu 24.04, GCC 13.3.0, ENet v1.3.18, a
 - **Localhost UDP**: a raw Python UDP round-trip succeeded (first-packet ~850 µs, thread-startup-dominated). A full ENet loopback (server + client hosts in one process) established a connection in **152 µs** and measured an application-level **round-trip of 15 µs**; one reliable and one unreliable packet were delivered correctly in each direction.
 - **ENet inside Godot (the crux)**: a GDExtension linking our own ENet v1.3.18, loaded into the Godot editor binary running headless, connected to a standalone Godot-free `netcore`-style C++ server on localhost:45200 and round-tripped a `"FLIGHT"` packet (`connected=1 echoed=1`, `NETPROBE PASS`). The Godot binary exports **zero** `enet_*` symbols dynamically, so no interposition of our statically-linked copy is possible. This retires the primary architectural risk of running our own ENet in the same process as Godot's bundled one.
 - **GDExtension registration**: same one-time `--headless --import` behaviour as increment 2 — it writes `extension_list.cfg` (portable `res://` paths) and then crashes in an unrelated editor-layout phase; committing `.godot/` sidesteps it, exactly as increment 2 documented.
-- **Network impairment**: `tc`, `netem`, and `ip` are unavailable in the sandbox (no `NET_ADMIN`). Latency/loss testing therefore uses the in-process impairment layer specified above, which is also more deterministic for CI than kernel netem.
+- **Network impairment**: `tc`, `netem`, and `ip` are unavailable in the sandbox (no `NET_ADMIN`). Latency/loss testing therefore uses the userspace UDP relay proxy specified in "Network impairment", which faithfully impairs the datagram stream ENet sees (unlike an above-ENet queue) and is more deterministic for CI than kernel netem.
 - **Reused transport verification path**: standalone server binary and Godot-loaded GDExtension client both linked the *same* ENet and exchanged packets — the concrete proof behind the `netcore`-shared-by-both-sides architecture.
+- **float32 orientation transport** (review m2): a float32 quaternion round-trip preserves extracted Euler angles to a max **0.002°** over 200 000 random attitudes, rising only to **0.003°** at 89.9° pitch (near gimbal lock). Single-precision orientation on the wire is therefore ample; the transport-fidelity comparison tolerance can sit far below any physically meaningful error, and no smallest-three encoding is needed for precision reasons.
