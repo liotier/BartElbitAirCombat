@@ -18,16 +18,9 @@
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
-#include <cmath>
+#include "geo/aircraft_orientation.h"
 
 namespace godot {
-
-namespace {
-constexpr double kDegToRad = M_PI / 180.0;
-// Standard flat-earth approximation, adequate for the short-range flight
-// this increment involves (see docs/increment-2-specification.md).
-constexpr double kMetersPerDegLat = 111320.0;
-}  // namespace
 
 Transform3D computeAircraftTransform(double lat_deg, double lon_deg,
                                       double alt_m, double roll_deg,
@@ -37,45 +30,25 @@ Transform3D computeAircraftTransform(double lat_deg, double lon_deg,
     // mapping is Godot X=East, Y=Altitude (MSL), Z=-North - chosen so that
     // an aircraft pointed true north (the increment 1 initial-condition
     // convention) faces Godot's default -Z forward direction.
-    double north_m = (lat_deg - refLat_deg) * kMetersPerDegLat;
-    double east_m = (lon_deg - refLon_deg) * kMetersPerDegLat *
-                     std::cos(refLat_deg * kDegToRad);
-    Vector3 position(static_cast<real_t>(east_m), static_cast<real_t>(alt_m),
-                      static_cast<real_t>(-north_m));
+    geo::LocalOffset offset =
+        geo::computeLocalOffset(lat_deg, lon_deg, refLat_deg, refLon_deg);
+    Vector3 position(static_cast<real_t>(offset.east_m),
+                      static_cast<real_t>(alt_m),
+                      static_cast<real_t>(-offset.north_m));
 
-    // Rotation: standard aerospace 3-2-1 (yaw-pitch-roll) direction-cosine
-    // matrix, giving each body axis expressed in the local NED frame.
-    double phi = roll_deg * kDegToRad;
-    double theta = pitch_deg * kDegToRad;
-    double psi = yaw_deg * kDegToRad;
-    double sphi = std::sin(phi), cphi = std::cos(phi);
-    double stheta = std::sin(theta), ctheta = std::cos(theta);
-    double spsi = std::sin(psi), cpsi = std::cos(psi);
-
-    // Body forward (nose) axis in NED.
-    double fwdN = ctheta * cpsi;
-    double fwdE = ctheta * spsi;
-    double fwdD = -stheta;
-
-    // Body right (right wing) axis in NED.
-    double rightN = sphi * stheta * cpsi - cphi * spsi;
-    double rightE = sphi * stheta * spsi + cphi * cpsi;
-    double rightD = sphi * ctheta;
-
-    // Body down (belly) axis in NED.
-    double downN = cphi * stheta * cpsi + sphi * spsi;
-    double downE = cphi * stheta * spsi - sphi * cpsi;
-    double downD = cphi * ctheta;
-
-    auto nedToGodot = [](double n, double e, double d) {
-        return Vector3(static_cast<real_t>(e), static_cast<real_t>(-d),
-                        static_cast<real_t>(-n));
-    };
-
-    Vector3 forward = nedToGodot(fwdN, fwdE, fwdD);
-    Vector3 right = nedToGodot(rightN, rightE, rightD);
-    Vector3 down = nedToGodot(downN, downE, downD);
-    Vector3 up = -down;
+    // Rotation axes: shared with docs/increment-3-specification.md's
+    // server-side wire quaternion (geo::computeOrientationQuat), so both
+    // ends of the network derive orientation from exactly one
+    // implementation of the aerospace-to-Godot axis convention.
+    geo::BodyAxes axes = geo::computeBodyAxes(roll_deg, pitch_deg, yaw_deg);
+    Vector3 right(static_cast<real_t>(axes.right.x),
+                  static_cast<real_t>(axes.right.y),
+                  static_cast<real_t>(axes.right.z));
+    Vector3 up(static_cast<real_t>(axes.up.x), static_cast<real_t>(axes.up.y),
+               static_cast<real_t>(axes.up.z));
+    Vector3 forward(static_cast<real_t>(axes.forward.x),
+                     static_cast<real_t>(axes.forward.y),
+                     static_cast<real_t>(axes.forward.z));
 
     // Godot's local -Z is forward and +X is right; a Basis is built from
     // where each local axis ends up (its columns).

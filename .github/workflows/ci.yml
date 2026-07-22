@@ -33,6 +33,14 @@ jobs:
           path: .godot-tools
           key: ${{ runner.os }}-godot-bin-${{ hashFiles('scripts/run_tests.sh') }}
 
+      # increment 3 spec, "Test runner and CI": run_tests.sh now also
+      # drives the networked phase (physics preservation, transport
+      # fidelity, input path, protocol, resilience via net_relay). No new
+      # system dependencies or CI configuration changed - ENet is
+      # self-contained C fetched by CMake, and net_relay uses only
+      # standard POSIX sockets already available on this runner image;
+      # the added phase measured well within the existing 20-minute
+      # budget.
       - name: Run full test suite
         run: ./scripts/run_tests.sh
 

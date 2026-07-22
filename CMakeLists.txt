@@ -63,6 +63,17 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(godot-cpp)
 
+# increment 3 spec, "ENet acquisition": pinned to the newest stable tag,
+# validated (pre-drafting) to configure and build with no option or
+# target conflict against JSBSim or godot-cpp.
+FetchContent_Declare(
+    enet
+    GIT_REPOSITORY https://github.com/lsalzman/enet.git
+    GIT_TAG        v1.3.18
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(enet)
+
 # increment 1's reusable core (FlightSession, CsvLogger), shared between
 # increment1_tests and the Godot GDExtension below (increment 2 spec,
 # "flightcore: sharing increment 1's code"). Deliberately has no dependency
@@ -70,6 +81,7 @@ FetchContent_MakeAvailable(godot-cpp)
 add_library(flightcore STATIC
     src/test_runner.cpp
     src/logging/csv_logger.cpp
+    src/geo/aircraft_orientation.cpp
 )
 target_include_directories(flightcore PUBLIC src)
 target_link_libraries(flightcore PUBLIC libJSBSim)
@@ -103,10 +115,56 @@ target_compile_options(flightcore PRIVATE -Wall -Wextra)
 add_library(flight_gdext SHARED
     src/godot_ext/register_types.cpp
     src/godot_ext/flight_aircraft.cpp
+    src/godot_ext/network_client.cpp
+    src/godot_ext/remote_aircraft.cpp
 )
-target_link_libraries(flight_gdext PRIVATE flightcore godot::cpp)
+target_link_libraries(flight_gdext PRIVATE flightcore netcore godot::cpp)
 target_compile_options(flight_gdext PRIVATE -Wall -Wextra)
 set_target_properties(flight_gdext PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/godot/bin"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/godot/bin"
 )
+
+# increment 3: netcore, a Godot-free static library depending only on
+# ENet (spec, "Architecture"). Defines the wire message types and their
+# serialization (protocol.h/.cpp) plus thin ENet host wrappers
+# (net_server, net_client), shared unmodified by flight_server,
+# flight_test_client, and flight_gdext's NetworkClient node so all three
+# compile the identical serialization code and therefore speak
+# byte-identical wire format.
+add_library(netcore STATIC
+    src/netcore/protocol.cpp
+    src/netcore/net_server.cpp
+    src/netcore/net_client.cpp
+    src/netcore/snapshot_log.cpp
+)
+target_include_directories(netcore PUBLIC src ${enet_SOURCE_DIR}/include)
+target_link_libraries(netcore PUBLIC enet)
+target_compile_options(netcore PRIVATE -Wall -Wextra)
+
+# The standalone authoritative server (spec, "Server (flight_server)").
+# No Godot dependency - links flightcore (FlightSession) and netcore only.
+add_executable(flight_server
+    src/server/main.cpp
+)
+target_link_libraries(flight_server PRIVATE flightcore netcore)
+target_compile_options(flight_server PRIVATE -Wall -Wextra)
+
+# The automated network test harness (spec, "flight_test_client"):
+# transport-fidelity, input-path, and protocol tests. Godot-free, links
+# netcore only (no FlightSession - it evaluates physics server-side).
+add_executable(flight_test_client
+    src/net_test/main.cpp
+)
+target_link_libraries(flight_test_client PRIVATE netcore)
+target_compile_options(flight_test_client PRIVATE -Wall -Wextra)
+
+# Userspace UDP relay proxy for latency/loss testing (spec, "Network
+# impairment"). Deliberately protocol-agnostic - forwards raw datagrams
+# without parsing them, so it impairs the actual byte stream ENet sees
+# rather than an application-level abstraction of it; no ENet or netcore
+# dependency needed.
+add_executable(net_relay
+    src/net_test/net_relay.cpp
+)
+target_compile_options(net_relay PRIVATE -Wall -Wextra)

@@ -1,10 +1,12 @@
 63f7b34db8d8cdea90c76aacccf841ec
-::res://::1784650768
-::res://bin/::1784650536
+::res://::1784651423
+::res://bin/::1784714022
 flight_gdext.gdextension::GDExtension::796146579881018033::1784650536::0::1::::<><><>0<>0<><>::
-::res://scenes/::1784650748
+::res://scenes/::1784714775
 headless_test.tscn::PackedScene::-1::1784650740::0::1::::<><><>0<>0<><>::res://scripts/headless_test_driver.gd
 main.tscn::PackedScene::-1::1784650748::0::1::::<><><>0<>0<><>::res://scripts/flight_input.gd
-::res://scripts/::1784650736
+networked.tscn::PackedScene::-1::1784714775::0::1::::<><><>0<>0<><>::res://scripts/networked_input.gd
+::res://scripts/::1784714752
 flight_input.gd::GDScript::7808088259436651482::1784650736::0::1::::<>Node<><>0<>0<><>::
-headless_test_driver.gd::GDScript::6112548143810860728::1784650723::0::1::::<>Node<><>0<>0<><>::
+headless_test_driver.gd::GDScript::6112548143810860728::1784650930::0::1::::<>Node<><>0<>0<><>::
+networked_input.gd::GDScript::8289291380316395670::1784714752::0::1::::<>Node<><>0<>0<><>::

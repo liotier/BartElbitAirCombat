@@ -16,6 +16,8 @@
 #include "register_types.h"
 
 #include "flight_aircraft.h"
+#include "network_client.h"
+#include "remote_aircraft.h"
 
 #include <gdextension_interface.h>
 #include <godot_cpp/core/defs.hpp>
@@ -26,6 +28,8 @@ using namespace godot;
 void initializeFlightGdextModule(ModuleInitializationLevel p_level) {
     if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) return;
     ClassDB::register_class<FlightAircraft>();
+    ClassDB::register_class<NetworkClient>();
+    ClassDB::register_class<RemoteAircraft>();
 }
 
 void uninitializeFlightGdextModule(ModuleInitializationLevel p_level) {
