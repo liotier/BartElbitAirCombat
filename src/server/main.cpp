@@ -273,7 +273,7 @@ int main(int argc, char** argv) {
             session.setProperty("fcs/rudder-cmd-norm",
                                  net::decodeAxis(lastInput.rudder));
             session.setProperty("fcs/throttle-cmd-norm",
-                                 net::decodeAxis(lastInput.throttle));
+                                 net::decodeThrottle(lastInput.throttle));
         }
         session.step();
         ++tick;

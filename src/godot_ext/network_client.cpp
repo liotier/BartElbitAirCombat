@@ -91,7 +91,7 @@ void NetworkClient::_physics_process(double delta) {
         input.elevator = net::encodeAxis(inputElevator_);
         input.aileron = net::encodeAxis(inputAileron_);
         input.rudder = net::encodeAxis(inputRudder_);
-        input.throttle = net::encodeAxis(inputThrottle_);
+        input.throttle = net::encodeThrottle(inputThrottle_);
         client_.send(net::kChannelUnreliable, net::serializeControlInput(input),
                      false);
     }

@@ -306,7 +306,7 @@ int runScriptedInputFlow(const Config& cfg, bool strict) {
             // whatever trim set it to - see docs/increment-3-
             // specification.md's implementation notes for why this test
             // does not attempt to hold the exact trimmed throttle.
-            input.throttle = net::encodeAxis(1.0);
+            input.throttle = net::encodeThrottle(1.0);
             client.send(net::kChannelUnreliable, net::serializeControlInput(input), false);
         }
     }

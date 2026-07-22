@@ -40,9 +40,20 @@ constexpr uint8_t kProtocolVersion = 1;
 constexpr uint8_t kChannelReliable = 0;
 constexpr uint8_t kChannelUnreliable = 1;
 
-// Fixed-point scale for control axes (spec Appendix A): wire value =
+// Fixed-point scale for the signed [-1,1] control axes (elevator,
+// aileron, rudder) (spec Appendix A): wire value =
 // round(physical_value * kControlAxisScale).
 constexpr double kControlAxisScale = 32767.0;
+
+// Fixed-point scale for throttle, [0,1] (spec Appendix A). A dedicated
+// uint8 rather than reusing the signed int16 axis encoding: throttle
+// never goes negative, so int16 would waste half its range (spec review
+// m3), and unlike elevator/aileron/rudder - which set rotation rates,
+// where visible quantization reads as jitter - throttle is a coarse,
+// movement-like axis. This mirrors Quake 3's own usercmd_t split:
+// forwardmove/rightmove/upmove (coarse) are a signed char; view angles
+// (rotation-sensitive) get 16 bits.
+constexpr double kThrottleScale = 255.0;
 
 enum class MessageTag : uint8_t {
     kClientHello = 1,
@@ -79,7 +90,7 @@ struct ControlInput {
     int16_t elevator = 0;
     int16_t aileron = 0;
     int16_t rudder = 0;
-    int16_t throttle = 0;
+    uint8_t throttle = 0;
 };
 
 // One aircraft's rigid-body state within a StateSnapshot (spec, "Messages"
@@ -100,10 +111,13 @@ struct StateSnapshot {
 
 using ByteBuffer = std::vector<uint8_t>;
 
-// value clamped to [-1, 1] before scaling; used for both control axes
-// ([-1,1]) and throttle ([0,1], a subset of the same clamp range).
+// value clamped to [-1, 1] before scaling; elevator/aileron/rudder.
 int16_t encodeAxis(double value);
 double decodeAxis(int16_t raw);
+
+// value clamped to [0, 1] before scaling; throttle only.
+uint8_t encodeThrottle(double value);
+double decodeThrottle(uint8_t raw);
 
 // Each serialize function returns a complete wire packet: the 1-byte tag
 // followed by the message's fields in the order tabulated in the spec.

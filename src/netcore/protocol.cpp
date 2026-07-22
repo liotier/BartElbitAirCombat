@@ -113,6 +113,15 @@ double decodeAxis(int16_t raw) {
     return static_cast<double>(raw) / kControlAxisScale;
 }
 
+uint8_t encodeThrottle(double value) {
+    double clamped = value < 0.0 ? 0.0 : (value > 1.0 ? 1.0 : value);
+    return static_cast<uint8_t>(std::lround(clamped * kThrottleScale));
+}
+
+double decodeThrottle(uint8_t raw) {
+    return static_cast<double>(raw) / kThrottleScale;
+}
+
 ByteBuffer serializeClientHello(const ClientHello& msg) {
     ByteWriter w;
     w.putU8(static_cast<uint8_t>(MessageTag::kClientHello));
@@ -168,7 +177,7 @@ ByteBuffer serializeControlInput(const ControlInput& msg) {
     w.putI16(msg.elevator);
     w.putI16(msg.aileron);
     w.putI16(msg.rudder);
-    w.putI16(msg.throttle);
+    w.putU8(msg.throttle);
     return w.take();
 }
 
@@ -178,7 +187,7 @@ bool deserializeControlInput(const uint8_t* data, size_t len,
     if (!checkTag(r, MessageTag::kControlInput)) return false;
     return r.getU32(out.client_seq) && r.getI16(out.elevator) &&
            r.getI16(out.aileron) && r.getI16(out.rudder) &&
-           r.getI16(out.throttle);
+           r.getU8(out.throttle);
 }
 
 ByteBuffer serializeStateSnapshot(const StateSnapshot& msg) {
