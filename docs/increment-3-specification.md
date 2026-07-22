@@ -120,7 +120,7 @@ All multi-byte fields are **little-endian** (documented assumption; all target p
 
 Field-width discipline, applied from this increment even though one client exercises it trivially, because wire-format decisions become hard caps later (Battlebit's 254-player limit is a byte-indexed player ID; that lesson is taken deliberately here):
 
-- **Player IDs are `uint8`.** One byte, 0 reserved for "server/none". This bounds a session to 255 players — comfortably beyond the 128-per-side target and a deliberate, documented choice, not an accident of using a wider type.
+- **Player IDs are `uint8`.** One byte, 0 reserved for "server/none". This bounds a session to 255 players — matching, with exactly one ID to spare, Battlebit's own 254-player precedent cited above (not a "128-per-side", i.e. 256-total, target: two sides of 128 would need 256 distinct IDs, one more than a reserved-zero `uint8` can give). A deliberate, documented choice, not an accident of using a wider type; a genuine 128-per-side target would need `uint16`.
 - **Control-axis inputs are `int16`, fixed-point** (value × 32767, clamped to axis range). A stick cannot be commanded finer than 1/32767; `int16` is a comfortable-margin narrow default. `int8` is viable and noted as a future tightening.
 - Snapshot spatial fields are `float32`, not `float64` — Godot's transform math is single-precision anyway (increment 2), and single-precision covers a local play area to sub-metre precision.
 
