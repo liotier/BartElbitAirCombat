@@ -22,6 +22,14 @@
 
 #include "logging/csv_logger.h"
 
+// Increment 4 (docs/increment-4-specification.md, "Reconstruction gate"):
+// FlightSession::getVState()/setVState() return/take FGPropagate's nested
+// VehicleState type, which - unlike a plain FGFDMExec* - needs FGPropagate
+// to be a complete type wherever the type name is used, not just where
+// it's defined. flightcore already links libJSBSim PUBLIC, so this is not
+// a new dependency, only its first use at the header level.
+#include "models/FGPropagate.h"
+
 #include <functional>
 #include <memory>
 #include <string>
@@ -69,6 +77,20 @@ public:
     void step();
 
     FlightSample sample() const;
+
+    // Increment 4: raw JSBSim access for the reconstruction-gate recipe
+    // (docs/increment-4-specification.md), which needs FGPropagate::
+    // GetTi2l()/SetLocation() - no property-tree equivalent exists for
+    // either.
+    JSBSim::FGFDMExec& fdm();
+    const JSBSim::FGFDMExec& fdm() const;
+
+    // Rigid-body state snapshot/restore (increment 4): near-zero cost
+    // (Appendix B: ~1 us/call), restores position/velocity/attitude
+    // exactly but not FCS actuator state - see docs/increment-4-
+    // specification.md, "Status".
+    JSBSim::FGPropagate::VehicleState getVState() const;
+    void setVState(const JSBSim::FGPropagate::VehicleState& vs);
 
 private:
     std::unique_ptr<JSBSim::FGFDMExec> fdm_;

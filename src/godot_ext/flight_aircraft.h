@@ -67,14 +67,21 @@ public:
     float getBankDeg() const;
     float getAlphaDeg() const;
 
-private:
+protected:
+    // Increment 4: PredictedAircraft subclasses FlightAircraft (proven
+    // workable, docs/increment-4-specification.md Appendix B) to inherit
+    // its FlightSession ownership and control/telemetry surface, adding
+    // prediction/reconciliation on top - which needs direct access to the
+    // session and the reference point trim() established.
     inc1::FlightSession session_;
-    inc1::CsvLogger logger_;
     inc1::FlightSample lastSample_;
     bool initialized_ = false;
-    bool logging_ = false;
     double refLat_ = 0.0;
     double refLon_ = 0.0;
+
+private:
+    inc1::CsvLogger logger_;
+    bool logging_ = false;
 };
 
 }  // namespace godot

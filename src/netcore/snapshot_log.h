@@ -42,6 +42,7 @@ void writeSnapshotCsvRow(std::ostream& out, const StateSnapshot& snap);
 // convenient tick-keyed comparison.
 struct LoggedAircraftRow {
     uint32_t server_tick;
+    uint32_t ack_client_seq;
     AircraftState state;
 };
 

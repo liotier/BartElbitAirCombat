@@ -15,6 +15,7 @@
 
 #include "protocol.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -173,11 +174,17 @@ bool deserializeServerReject(const uint8_t* data, size_t len,
 ByteBuffer serializeControlInput(const ControlInput& msg) {
     ByteWriter w;
     w.putU8(static_cast<uint8_t>(MessageTag::kControlInput));
-    w.putU32(msg.client_seq);
-    w.putI16(msg.elevator);
-    w.putI16(msg.aileron);
-    w.putI16(msg.rudder);
-    w.putU8(msg.throttle);
+    w.putU32(msg.newest_client_seq);
+    uint8_t count = static_cast<uint8_t>(
+        std::min<size_t>(msg.commands.size(), kMaxRedundantCommands));
+    w.putU8(count);
+    for (uint8_t i = 0; i < count; ++i) {
+        const ControlCommand& c = msg.commands[i];
+        w.putI16(c.elevator);
+        w.putI16(c.aileron);
+        w.putI16(c.rudder);
+        w.putU8(c.throttle);
+    }
     return w.take();
 }
 
@@ -185,21 +192,33 @@ bool deserializeControlInput(const uint8_t* data, size_t len,
                               ControlInput& out) {
     ByteReader r(data, len);
     if (!checkTag(r, MessageTag::kControlInput)) return false;
-    return r.getU32(out.client_seq) && r.getI16(out.elevator) &&
-           r.getI16(out.aileron) && r.getI16(out.rudder) &&
-           r.getU8(out.throttle);
+    uint8_t count;
+    if (!r.getU32(out.newest_client_seq) || !r.getU8(count)) return false;
+    out.commands.clear();
+    out.commands.reserve(count);
+    for (uint8_t i = 0; i < count; ++i) {
+        ControlCommand c;
+        if (!r.getI16(c.elevator) || !r.getI16(c.aileron) ||
+            !r.getI16(c.rudder) || !r.getU8(c.throttle)) {
+            return false;
+        }
+        out.commands.push_back(c);
+    }
+    return true;
 }
 
 ByteBuffer serializeStateSnapshot(const StateSnapshot& msg) {
     ByteWriter w;
     w.putU8(static_cast<uint8_t>(MessageTag::kStateSnapshot));
     w.putU32(msg.server_tick);
+    w.putU32(msg.ack_client_seq);
     w.putU8(static_cast<uint8_t>(msg.aircraft.size()));
     for (const AircraftState& a : msg.aircraft) {
         w.putU8(a.player_id);
         for (float v : a.pos_local_m) w.putF32(v);
         for (float v : a.quat) w.putF32(v);
         for (float v : a.vel_local_mps) w.putF32(v);
+        for (float v : a.ang_vel_body_rps) w.putF32(v);
         w.putU8(a.status_flags);
     }
     return w.take();
@@ -210,7 +229,10 @@ bool deserializeStateSnapshot(const uint8_t* data, size_t len,
     ByteReader r(data, len);
     if (!checkTag(r, MessageTag::kStateSnapshot)) return false;
     uint8_t count;
-    if (!r.getU32(out.server_tick) || !r.getU8(count)) return false;
+    if (!r.getU32(out.server_tick) || !r.getU32(out.ack_client_seq) ||
+        !r.getU8(count)) {
+        return false;
+    }
     out.aircraft.clear();
     out.aircraft.reserve(count);
     for (uint8_t i = 0; i < count; ++i) {
@@ -223,6 +245,9 @@ bool deserializeStateSnapshot(const uint8_t* data, size_t len,
             if (!r.getF32(v)) return false;
         }
         for (float& v : a.vel_local_mps) {
+            if (!r.getF32(v)) return false;
+        }
+        for (float& v : a.ang_vel_body_rps) {
             if (!r.getF32(v)) return false;
         }
         if (!r.getU8(a.status_flags)) return false;

@@ -47,6 +47,26 @@ struct BodyAxes {
 // Euler angles in the local NED frame.
 BodyAxes computeBodyAxes(double roll_deg, double pitch_deg, double yaw_deg);
 
+// The fixed NED -> Godot-engine-axes coordinate remap (X=East, Y=Up,
+// Z=-North), factored out of computeBodyAxes() so computeBodyAxesFromQuat()
+// below can share it. A proper rotation (det=+1), not a reflection, so it
+// can be applied directly to any NED-frame vector.
+Vec3d nedToGodot(Vec3d ned);
+
+// Same physical rotation as computeBodyAxes(), derived directly from
+// JSBSim's native local-attitude quaternion (docs/increment-4-
+// specification.md's wire `quat` field) instead of Euler angles - so the
+// display side never decomposes to Euler and is gimbal-safe. q0..q3 are
+// JSBSim's own FGQuaternion component order, q(1..4) i.e. (w,x,y,z) -
+// *not* Godot's (x,y,z,w). The matrix formula is transcribed verbatim from
+// FGQuaternion::ComputeDerivedUnconditional() (Stevens & Lewis Eqn.
+// 1.3-32); verified (docs/increment-4-specification.md Appendix B) to
+// reproduce computeBodyAxes()'s result to float precision across a full
+// attitude sweep including inverted and near-vertical flight, so the two
+// must never be allowed to silently diverge - if either formula changes,
+// re-run that check.
+BodyAxes computeBodyAxesFromQuat(double q0, double q1, double q2, double q3);
+
 struct Quatf {
     float x = 0.0f;
     float y = 0.0f;
@@ -75,5 +95,17 @@ struct LocalOffset {
 };
 LocalOffset computeLocalOffset(double lat_deg, double lon_deg,
                                 double ref_lat_deg, double ref_lon_deg);
+
+// Exact inverse of computeLocalOffset(): the (lat_deg, lon_deg) that
+// offsets (east_m, north_m) from (ref_lat_deg, ref_lon_deg) - increment 4's
+// reconciliation needs this to turn a received StateSnapshot's local-frame
+// position back into geodetic coordinates for VehicleState reconstruction
+// (docs/increment-4-specification.md, "Reconstruction gate").
+struct GeodeticPos {
+    double lat_deg = 0.0;
+    double lon_deg = 0.0;
+};
+GeodeticPos invertLocalOffset(double east_m, double north_m,
+                               double ref_lat_deg, double ref_lon_deg);
 
 }  // namespace geo

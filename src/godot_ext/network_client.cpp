@@ -16,9 +16,12 @@
 #include "network_client.h"
 
 #include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/variant/basis.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <enet/enet.h>
+
+#include "geo/aircraft_orientation.h"
 
 namespace godot {
 
@@ -86,12 +89,20 @@ void NetworkClient::_physics_process(double delta) {
     constexpr double kInputSendPeriod = 1.0 / 60.0;  // spec, "Rates"
     if (sinceLastInputSend_ >= kInputSendPeriod) {
         sinceLastInputSend_ = 0.0;
+        // No redundancy (count=1): this node does not predict, so unlike
+        // PredictedAircraft it has no buffered history of past commands to
+        // resend, and is not this increment's tested path (docs/
+        // increment-4-specification.md - PredictedAircraft replaces this
+        // node's role in networked.tscn). A single fresh command per
+        // packet is still wire-valid and behaves as increment 3's did.
         net::ControlInput input;
-        input.client_seq = ++clientSeq_;
-        input.elevator = net::encodeAxis(inputElevator_);
-        input.aileron = net::encodeAxis(inputAileron_);
-        input.rudder = net::encodeAxis(inputRudder_);
-        input.throttle = net::encodeThrottle(inputThrottle_);
+        input.newest_client_seq = ++clientSeq_;
+        net::ControlCommand cmd;
+        cmd.elevator = net::encodeAxis(inputElevator_);
+        cmd.aileron = net::encodeAxis(inputAileron_);
+        cmd.rudder = net::encodeAxis(inputRudder_);
+        cmd.throttle = net::encodeThrottle(inputThrottle_);
+        input.commands.push_back(cmd);
         client_.send(net::kChannelUnreliable, net::serializeControlInput(input),
                      false);
     }
@@ -139,8 +150,25 @@ Vector3 NetworkClient::getRemotePosition() const {
 }
 
 Quaternion NetworkClient::getRemoteOrientation() const {
-    return Quaternion(latestAircraft_.quat[0], latestAircraft_.quat[1],
-                       latestAircraft_.quat[2], latestAircraft_.quat[3]);
+    // Increment 4: the wire quat is JSBSim's native qAttitudeLocal
+    // (q(1..4) = w,x,y,z), not Godot's (x,y,z,w) - reinterpreting it
+    // directly (increment 3's approach) would silently misinterpret the
+    // rotation. geo::computeBodyAxesFromQuat() converts without ever
+    // decomposing to Euler angles (gimbal-safe), verified against the
+    // shipped Euler-angle path (docs/increment-4-specification.md
+    // Appendix B).
+    geo::BodyAxes axes = geo::computeBodyAxesFromQuat(
+        latestAircraft_.quat[0], latestAircraft_.quat[1],
+        latestAircraft_.quat[2], latestAircraft_.quat[3]);
+    Vector3 right(static_cast<real_t>(axes.right.x),
+                  static_cast<real_t>(axes.right.y),
+                  static_cast<real_t>(axes.right.z));
+    Vector3 up(static_cast<real_t>(axes.up.x), static_cast<real_t>(axes.up.y),
+               static_cast<real_t>(axes.up.z));
+    Vector3 forward(static_cast<real_t>(axes.forward.x),
+                     static_cast<real_t>(axes.forward.y),
+                     static_cast<real_t>(axes.forward.z));
+    return Basis(right, up, -forward).get_rotation_quaternion();
 }
 
 Vector3 NetworkClient::getRemoteVelocity() const {

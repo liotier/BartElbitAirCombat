@@ -16,14 +16,19 @@
 
 # Orchestrates the full validation pipeline: increment 1's standalone suite
 # (docs/increment-1-specification.md, "Test runner"), the five Godot-driven
-# tests (docs/increment-2-specification.md, "Test scenarios"), then the
+# tests (docs/increment-2-specification.md, "Test scenarios"), the
 # increment-3 networked phase (docs/increment-3-specification.md, "Test
 # runner and CI"): physics preservation, transport fidelity, the input
 # path, protocol (handshake/version-reject/disconnect), and resilience
-# through net_relay. All pass/fail evaluation happens inside the test
-# binaries or the headless test driver script; this script only
-# configures, builds, fetches Godot, invokes everything, starts/stops the
-# server and relay processes it needs, and relays exit status.
+# through net_relay - then the increment-4 prediction/reconciliation phase
+# (docs/increment-4-specification.md, "Test plan"): the reconstruction-gate
+# regression test, prediction correctness on a clean link, reconciliation
+# correctness with its required negative control, aggressive-analog
+# resilience under loss, and a repeat under injected latency. All
+# pass/fail evaluation happens inside the test binaries or the headless
+# test driver script; this script only configures, builds, fetches Godot,
+# invokes everything, starts/stops the server and relay processes it
+# needs, and relays exit status.
 #
 # Exit codes: 0 all tests passed, 1 a test failed, 2 a required tool is
 # missing, 3 cmake configure failed, 4 the build failed, 5 the increment 1
@@ -123,6 +128,7 @@ echo "== Running increment 3 networked tests =="
 FLIGHT_SERVER="$BUILD_DIR/flight_server"
 FLIGHT_TEST_CLIENT="$BUILD_DIR/flight_test_client"
 NET_RELAY="$BUILD_DIR/net_relay"
+PREDICTCORE_TESTS="$BUILD_DIR/predictcore_tests"
 NET_PORT=45300
 RELAY_PORT=45301
 
@@ -219,7 +225,6 @@ LOSS_STATUS=$?
 set -e
 
 cleanup_net_procs
-trap - EXIT
 
 NET3_OVERALL_STATUS=0
 for status in "$PHYSICS_STATUS" "$FIDELITY_STATUS" "$PROTOCOL_STATUS" "$LATENCY_STATUS" "$LOSS_STATUS"; do
@@ -228,7 +233,141 @@ for status in "$PHYSICS_STATUS" "$FIDELITY_STATUS" "$PROTOCOL_STATUS" "$LATENCY_
   fi
 done
 
-if [ "$BINARY_STATUS" -ne 0 ] || [ "$GODOT_OVERALL_STATUS" -ne 0 ] || [ "$NET3_OVERALL_STATUS" -ne 0 ]; then
+echo "== Running increment 4 prediction tests =="
+
+# Step: the reconstruction-gate regression test (docs/increment-4-
+# specification.md, "Reconstruction gate", acceptance criterion 1) - pure
+# JSBSim, no server/client needed.
+echo "-- reconstruction gate (regression test) --"
+set +e
+"$PREDICTCORE_TESTS"
+GATE_STATUS=$?
+set -e
+
+# Step: prediction correctness on a clean link - tests 1 (immediate
+# response), 2 (eventual agreement), 4 (bounded envelope tracking).
+# Reuses server_pitch_response.csv, already produced above by the
+# physics-preservation step (identical IC + schedule, so it is valid
+# ground truth here too).
+echo "-- prediction: step schedule, clean link --"
+"$FLIGHT_SERVER" --port "$NET_PORT" --snapshot-hz 30 --log-name networked_predict_step &
+CURRENT_SERVER_PID=$!
+sleep 1
+
+set +e
+"$FLIGHT_TEST_CLIENT" --mode prediction --host 127.0.0.1 --port "$NET_PORT" \
+  --input-schedule step --duration-s 8 \
+  --predicted-log "$RESULTS_DIR/client_predicted_step.csv" \
+  --ground-truth-log "$RESULTS_DIR/server_pitch_response.csv"
+PREDICT_STEP_STATUS=$?
+set -e
+
+cleanup_net_procs
+
+# Step: reconciliation correctness and its required negative control
+# (test 3, review finding M1) - a deterministic forced misprediction
+# (docs/increment-4-specification.md's "Open questions": an artificial
+# state offset, chosen over probabilistic loss-forcing so this is not
+# flaky), once with reconciliation enabled (must recover) and once
+# disabled (must persist - proving the corrective code, not chance, is
+# what fixes the state).
+echo "-- prediction: forced misprediction, reconciliation on --"
+"$FLIGHT_SERVER" --port "$NET_PORT" --snapshot-hz 30 --log-name networked_predict_forced_on &
+CURRENT_SERVER_PID=$!
+sleep 1
+
+set +e
+"$FLIGHT_TEST_CLIENT" --mode prediction --host 127.0.0.1 --port "$NET_PORT" \
+  --input-schedule step --duration-s 8 --force-desync --reconciliation on \
+  --predicted-log "$RESULTS_DIR/client_predicted_forced_on.csv" \
+  --ground-truth-log "$RESULTS_DIR/server_pitch_response.csv"
+PREDICT_FORCED_ON_STATUS=$?
+set -e
+
+cleanup_net_procs
+
+echo "-- prediction: forced misprediction, reconciliation off (negative control) --"
+"$FLIGHT_SERVER" --port "$NET_PORT" --snapshot-hz 30 --log-name networked_predict_forced_off &
+CURRENT_SERVER_PID=$!
+sleep 1
+
+set +e
+"$FLIGHT_TEST_CLIENT" --mode prediction --host 127.0.0.1 --port "$NET_PORT" \
+  --input-schedule step --duration-s 8 --force-desync --reconciliation off \
+  --predicted-log "$RESULTS_DIR/client_predicted_forced_off.csv" \
+  --ground-truth-log "$RESULTS_DIR/server_pitch_response.csv"
+PREDICT_FORCED_OFF_STATUS=$?
+set -e
+
+cleanup_net_procs
+
+# Step: aggressive-analog resilience under loss (test 5, review finding
+# B2) - the test that would have caught the increment-3 "most recent
+# input" server model's desync under a realistic (joystick-like)
+# controller; verifies the redundant-command-buffer fix actually holds.
+echo "-- prediction: aggressive analog, 20% loss --"
+"$FLIGHT_SERVER" --port "$NET_PORT" --snapshot-hz 30 --log-name networked_predict_analog_loss &
+CURRENT_SERVER_PID=$!
+sleep 1
+"$NET_RELAY" --listen-port "$RELAY_PORT" --server-host 127.0.0.1 --server-port "$NET_PORT" \
+  --delay-ms 0 --drop-percent 20 --seed 54321 &
+CURRENT_RELAY_PID=$!
+sleep 0.5
+
+set +e
+"$FLIGHT_TEST_CLIENT" --mode prediction --host 127.0.0.1 --port "$RELAY_PORT" \
+  --input-schedule analog --duration-s 8 \
+  --predicted-log "$RESULTS_DIR/client_predicted_analog_loss.csv"
+PREDICT_ANALOG_LOSS_STATUS=$?
+set -e
+
+cleanup_net_procs
+
+# Step: repeat the immediate-response / bounded-tracking assertions under
+# 100 ms one-way latency (test 6; also acceptance criterion 3, which
+# specifically requires >=100 ms injected latency for "immediate
+# response" to be a meaningful assertion rather than something a
+# non-predicting client would also pass). --skip-eventual-agreement:
+# test 2 compares against server_pitch_response.csv, a *zero-latency*
+# standalone ground truth - under real injected latency the server's own
+# authoritative trajectory is genuinely, persistently behind that (it can
+# only apply a command once it actually arrives), so every reconciliation
+# pulls this client toward a lagged truth. That is correct behaviour, not
+# a bug, but it breaks test 2's comparison premise (confirmed by direct
+# measurement); immediate-response and bounded-tracking, which this step
+# exists to repeat under latency, do not depend on that premise and are
+# still asserted.
+echo "-- prediction: step schedule, 100ms latency --"
+"$FLIGHT_SERVER" --port "$NET_PORT" --snapshot-hz 30 --log-name networked_predict_step_latency &
+CURRENT_SERVER_PID=$!
+sleep 1
+"$NET_RELAY" --listen-port "$RELAY_PORT" --server-host 127.0.0.1 --server-port "$NET_PORT" \
+  --delay-ms 100 --drop-percent 0 --seed 54321 &
+CURRENT_RELAY_PID=$!
+sleep 0.5
+
+set +e
+"$FLIGHT_TEST_CLIENT" --mode prediction --host 127.0.0.1 --port "$RELAY_PORT" \
+  --input-schedule step --duration-s 8 --skip-eventual-agreement \
+  --predicted-log "$RESULTS_DIR/client_predicted_step_latency.csv" \
+  --ground-truth-log "$RESULTS_DIR/server_pitch_response.csv"
+PREDICT_STEP_LATENCY_STATUS=$?
+set -e
+
+cleanup_net_procs
+trap - EXIT
+
+NET4_OVERALL_STATUS=0
+for status in "$GATE_STATUS" "$PREDICT_STEP_STATUS" "$PREDICT_FORCED_ON_STATUS" \
+              "$PREDICT_FORCED_OFF_STATUS" "$PREDICT_ANALOG_LOSS_STATUS" \
+              "$PREDICT_STEP_LATENCY_STATUS"; do
+  if [ "$status" -ne 0 ]; then
+    NET4_OVERALL_STATUS=1
+  fi
+done
+
+if [ "$BINARY_STATUS" -ne 0 ] || [ "$GODOT_OVERALL_STATUS" -ne 0 ] || \
+   [ "$NET3_OVERALL_STATUS" -ne 0 ] || [ "$NET4_OVERALL_STATUS" -ne 0 ]; then
   exit 1
 fi
 exit 0

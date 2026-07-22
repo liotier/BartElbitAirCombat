@@ -17,6 +17,7 @@
 
 #include "flight_aircraft.h"
 #include "network_client.h"
+#include "predicted_aircraft.h"
 #include "remote_aircraft.h"
 
 #include <gdextension_interface.h>
@@ -30,6 +31,7 @@ void initializeFlightGdextModule(ModuleInitializationLevel p_level) {
     ClassDB::register_class<FlightAircraft>();
     ClassDB::register_class<NetworkClient>();
     ClassDB::register_class<RemoteAircraft>();
+    ClassDB::register_class<PredictedAircraft>();
 }
 
 void uninitializeFlightGdextModule(ModuleInitializationLevel p_level) {

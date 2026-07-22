@@ -85,6 +85,17 @@ double FlightSession::property(const std::string& name) const {
 
 void FlightSession::step() { fdm_->Run(); }
 
+JSBSim::FGFDMExec& FlightSession::fdm() { return *fdm_; }
+const JSBSim::FGFDMExec& FlightSession::fdm() const { return *fdm_; }
+
+JSBSim::FGPropagate::VehicleState FlightSession::getVState() const {
+    return fdm_->GetPropagate()->GetVState();
+}
+
+void FlightSession::setVState(const JSBSim::FGPropagate::VehicleState& vs) {
+    fdm_->GetPropagate()->SetVState(vs);
+}
+
 FlightSample FlightSession::sample() const {
     FlightSample s;
     s.time_s = property("simulation/sim-time-sec");

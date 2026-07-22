@@ -41,6 +41,12 @@ jobs:
       # standard POSIX sockets already available on this runner image;
       # the added phase measured well within the existing 20-minute
       # budget.
+      #
+      # increment 4 spec, "Acceptance criteria" #6: adds six more
+      # networked test invocations (~8s wall-clock duration each plus
+      # ~1.5s server/relay startup) - well under a minute of added time,
+      # confirmed to remain inside the existing 20-minute budget rather
+      # than requiring it to be raised.
       - name: Run full test suite
         run: ./scripts/run_tests.sh
 

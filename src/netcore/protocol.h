@@ -55,6 +55,13 @@ constexpr double kControlAxisScale = 32767.0;
 // (rotation-sensitive) get 16 bits.
 constexpr double kThrottleScale = 255.0;
 
+// Increment 4, "Wire protocol changes" / "Open questions": redundancy
+// depth R for ControlInput's repeated commands. Must exceed the longest
+// consecutive-packet-loss run this project's tests care about; at R=6 a
+// command survives unless all 6 carrying packets drop (0.4^6 ~= 0.4% at
+// 40% loss - verified, docs/increment-4-specification.md Appendix B).
+constexpr uint8_t kMaxRedundantCommands = 6;
+
 enum class MessageTag : uint8_t {
     kClientHello = 1,
     kServerWelcome = 2,
@@ -85,12 +92,24 @@ struct ServerReject {
     uint8_t reason_code = 0;
 };
 
-struct ControlInput {
-    uint32_t client_seq = 0;
+// One tick's worth of control-axis input (increment 4, "Wire protocol
+// changes"). Encoded fields, same fixed-point scales as increment 3.
+struct ControlCommand {
     int16_t elevator = 0;
     int16_t aileron = 0;
     int16_t rudder = 0;
     uint8_t throttle = 0;
+};
+
+// Increment 4: redundant multi-command packet (review finding B2) - the
+// Quake/Source pattern of resending the last few commands per packet so a
+// single dropped packet loses no command. `commands` holds up to
+// kMaxRedundantCommands entries for seqs newest_client_seq,
+// newest_client_seq-1, ... in descending order (see protocol.cpp's
+// (de)serialization for the exact wire order).
+struct ControlInput {
+    uint32_t newest_client_seq = 0;
+    std::vector<ControlCommand> commands;
 };
 
 // One aircraft's rigid-body state within a StateSnapshot (spec, "Messages"
@@ -99,13 +118,26 @@ struct ControlInput {
 struct AircraftState {
     uint8_t player_id = 0;
     float pos_local_m[3] = {0.0f, 0.0f, 0.0f};  // East, Up, -North
-    float quat[4] = {0.0f, 0.0f, 0.0f, 1.0f};   // x, y, z, w
+    // Increment 4 (docs/increment-4-specification.md Appendix A): JSBSim's
+    // native qAttitudeLocal (body->NED) components in q(1..4) order, i.e.
+    // (w,x,y,z) - *not* Godot's (x,y,z,w), and *not* increment 3's
+    // Godot-convention quaternion. Chosen so reconciliation's VehicleState
+    // reconstruction needs no conversion; display code must convert via
+    // geo::computeBodyAxesFromQuat() (gimbal-safe, no Euler decomposition).
+    float quat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float vel_local_mps[3] = {0.0f, 0.0f, 0.0f};
+    // Increment 4: body-frame roll/pitch/yaw rate (JSBSim p,q,r), rad/s -
+    // fed straight to VehicleState::vPQR with no rotation.
+    float ang_vel_body_rps[3] = {0.0f, 0.0f, 0.0f};
     uint8_t status_flags = 0;
 };
 
 struct StateSnapshot {
     uint32_t server_tick = 0;
+    // Increment 4: highest client_seq the server has applied as of this
+    // tick - connection-scoped (meaningful only to the client that owns
+    // this connection), not a per-aircraft property.
+    uint32_t ack_client_seq = 0;
     std::vector<AircraftState> aircraft;
 };
 

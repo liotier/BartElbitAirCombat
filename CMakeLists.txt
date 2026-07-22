@@ -117,8 +117,9 @@ add_library(flight_gdext SHARED
     src/godot_ext/flight_aircraft.cpp
     src/godot_ext/network_client.cpp
     src/godot_ext/remote_aircraft.cpp
+    src/godot_ext/predicted_aircraft.cpp
 )
-target_link_libraries(flight_gdext PRIVATE flightcore netcore godot::cpp)
+target_link_libraries(flight_gdext PRIVATE flightcore netcore predictcore godot::cpp)
 target_compile_options(flight_gdext PRIVATE -Wall -Wextra)
 set_target_properties(flight_gdext PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/godot/bin"
@@ -142,6 +143,29 @@ target_include_directories(netcore PUBLIC src ${enet_SOURCE_DIR}/include)
 target_link_libraries(netcore PUBLIC enet)
 target_compile_options(netcore PRIVATE -Wall -Wextra)
 
+# increment 4: predictcore, a Godot-free static library depending on
+# flightcore (FlightSession, geo::) and netcore (wire types, encodeAxis/
+# decodeAxis) (spec, "Architecture"). Defines PredictedSession, the
+# reusable predict/buffer/reconcile/replay algorithm shared unmodified by
+# the Godot client (PredictedAircraft) and flight_test_client's --mode
+# prediction - the same reasoning increment 3 used for netcore itself.
+add_library(predictcore STATIC
+    src/predictcore/reconstruction.cpp
+    src/predictcore/reconciliation_math.cpp
+    src/predictcore/predicted_session.cpp
+)
+target_include_directories(predictcore PUBLIC src)
+target_link_libraries(predictcore PUBLIC flightcore netcore)
+target_compile_options(predictcore PRIVATE -Wall -Wextra)
+
+# The increment-4 reconstruction-gate regression test (spec, acceptance
+# criterion 1) - Godot-free, links predictcore + flightcore only.
+add_executable(predictcore_tests
+    src/predictcore/gate_regression_test.cpp
+)
+target_link_libraries(predictcore_tests PRIVATE predictcore flightcore)
+target_compile_options(predictcore_tests PRIVATE -Wall -Wextra)
+
 # The standalone authoritative server (spec, "Server (flight_server)").
 # No Godot dependency - links flightcore (FlightSession) and netcore only.
 add_executable(flight_server
@@ -151,12 +175,14 @@ target_link_libraries(flight_server PRIVATE flightcore netcore)
 target_compile_options(flight_server PRIVATE -Wall -Wextra)
 
 # The automated network test harness (spec, "flight_test_client"):
-# transport-fidelity, input-path, and protocol tests. Godot-free, links
-# netcore only (no FlightSession - it evaluates physics server-side).
+# transport-fidelity, input-path, and protocol tests. Increment 4 adds
+# --mode prediction, which runs a real PredictedSession (predictcore) and
+# therefore needs flightcore too - increments 1-3's modes remain
+# Godot-free/physics-free (netcore only, evaluating physics server-side).
 add_executable(flight_test_client
     src/net_test/main.cpp
 )
-target_link_libraries(flight_test_client PRIVATE netcore)
+target_link_libraries(flight_test_client PRIVATE netcore predictcore flightcore)
 target_compile_options(flight_test_client PRIVATE -Wall -Wextra)
 
 # Userspace UDP relay proxy for latency/loss testing (spec, "Network

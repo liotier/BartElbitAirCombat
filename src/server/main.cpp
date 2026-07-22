@@ -29,6 +29,8 @@
 #include "netcore/snapshot_log.h"
 #include "test_runner.h"
 
+#include "math/FGQuaternion.h"
+
 #include <enet/enet.h>
 
 #include <algorithm>
@@ -40,6 +42,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <string>
 
 namespace {
@@ -158,9 +161,19 @@ int main(int argc, char** argv) {
 
     ENetPeer* clientPeer = nullptr;
     uint8_t clientPlayerId = 0;
-    net::ControlInput lastInput{};
+    // Ordered command buffer fed by redundant ControlInput packets (spec,
+    // "Wire protocol changes" / review finding B2): pendingCommands holds
+    // received-but-not-yet-applied commands, keyed by client_seq;
+    // nextExpectedSeq is the next one the server needs; highestSeqSeen is
+    // the highest newest_client_seq any packet has ever reported, used to
+    // detect a seq that can never arrive anymore (the client's own
+    // redundancy window has moved past it in every packet that could
+    // still carry it).
+    std::map<uint32_t, net::ControlCommand> pendingCommands;
+    uint32_t nextExpectedSeq = 1;
+    uint32_t highestSeqSeen = 0;
+    net::ControlCommand lastAppliedCommand{};
     bool hasInput = false;
-    uint32_t lastSeq = 0;
 
     auto onEvent = [&](const ENetEvent& event) {
         if (event.type == ENET_EVENT_TYPE_DISCONNECT) {
@@ -168,6 +181,10 @@ int main(int argc, char** argv) {
                 clientPeer = nullptr;
                 clientPlayerId = 0;
                 hasInput = false;
+                pendingCommands.clear();
+                nextExpectedSeq = 1;
+                highestSeqSeen = 0;
+                lastAppliedCommand = net::ControlCommand{};
             }
             return;
         }
@@ -212,7 +229,10 @@ int main(int argc, char** argv) {
                 clientPeer = event.peer;
                 clientPlayerId = 1;
                 hasInput = false;
-                lastSeq = 0;
+                pendingCommands.clear();
+                nextExpectedSeq = 1;
+                highestSeqSeen = 0;
+                lastAppliedCommand = net::ControlCommand{};
                 net::ServerWelcome welcome{
                     net::kProtocolVersion, clientPlayerId,
                     static_cast<float>(originLat),
@@ -230,11 +250,22 @@ int main(int argc, char** argv) {
                                                    input)) {
                     return;
                 }
-                // client_seq lets the server ignore out-of-order/stale
-                // input (spec, "Wire protocol" notes).
-                if (hasInput && input.client_seq <= lastSeq) return;
-                lastInput = input;
-                lastSeq = input.client_seq;
+                // Redundant multi-command packet (spec, "Wire protocol
+                // changes" / review finding B2): merge every command not
+                // already decided into the ordered buffer. Commands are
+                // seqs newest_client_seq, newest_client_seq-1, ...
+                // descending; the `i <= newest_client_seq` bound avoids
+                // underflowing seq for a short first packet.
+                for (size_t i = 0;
+                     i < input.commands.size() && i <= input.newest_client_seq;
+                     ++i) {
+                    uint32_t seq =
+                        input.newest_client_seq - static_cast<uint32_t>(i);
+                    if (seq >= nextExpectedSeq) {
+                        pendingCommands[seq] = input.commands[i];
+                    }
+                }
+                highestSeqSeen = std::max(highestSeqSeen, input.newest_client_seq);
                 hasInput = true;
                 break;
             }
@@ -266,14 +297,33 @@ int main(int argc, char** argv) {
             // 1's validated one.
             if (t >= 5.0) session.setProperty("fcs/elevator-cmd-norm", -1.0);
         } else if (hasInput) {
+            // Apply exactly one command per tick, in ascending client_seq
+            // order, holding the last applied command across a gap (spec,
+            // "Wire protocol changes"). A seq becomes provably
+            // unrecoverable once the client has moved
+            // kMaxRedundantCommands past it in every packet that could
+            // still have carried it - skip forward past it (still holding
+            // the last command for its tick) rather than stalling.
+            auto pendingIt = pendingCommands.find(nextExpectedSeq);
+            if (pendingIt != pendingCommands.end()) {
+                lastAppliedCommand = pendingIt->second;
+                ++nextExpectedSeq;
+            } else if (highestSeqSeen >=
+                       nextExpectedSeq + net::kMaxRedundantCommands) {
+                ++nextExpectedSeq;
+            }
+            pendingCommands.erase(pendingCommands.begin(),
+                                   pendingCommands.lower_bound(nextExpectedSeq));
+
             session.setProperty("fcs/elevator-cmd-norm",
-                                 net::decodeAxis(lastInput.elevator));
+                                 net::decodeAxis(lastAppliedCommand.elevator));
             session.setProperty("fcs/aileron-cmd-norm",
-                                 net::decodeAxis(lastInput.aileron));
+                                 net::decodeAxis(lastAppliedCommand.aileron));
             session.setProperty("fcs/rudder-cmd-norm",
-                                 net::decodeAxis(lastInput.rudder));
-            session.setProperty("fcs/throttle-cmd-norm",
-                                 net::decodeThrottle(lastInput.throttle));
+                                 net::decodeAxis(lastAppliedCommand.rudder));
+            session.setProperty(
+                "fcs/throttle-cmd-norm",
+                net::decodeThrottle(lastAppliedCommand.throttle));
         }
         session.step();
         ++tick;
@@ -283,6 +333,11 @@ int main(int argc, char** argv) {
         if (tick % static_cast<uint32_t>(snapshotInterval) == 0) {
             net::StateSnapshot snap;
             snap.server_tick = tick;
+            // nextExpectedSeq starts at 1 whether or not any input has
+            // arrived yet, so this is 0 (meaning "nothing applied yet")
+            // in both scripted mode and before a networked client's first
+            // packet, with no special-casing needed.
+            snap.ack_client_seq = nextExpectedSeq - 1;
             net::AircraftState a;
             a.player_id = 1;
             geo::LocalOffset off = geo::computeLocalOffset(
@@ -290,16 +345,27 @@ int main(int argc, char** argv) {
             a.pos_local_m[0] = static_cast<float>(off.east_m);
             a.pos_local_m[1] = static_cast<float>(sample.alt_m);
             a.pos_local_m[2] = static_cast<float>(-off.north_m);
-            geo::Quatf q = geo::computeOrientationQuat(
-                sample.roll_deg, sample.pitch_deg, sample.yaw_deg);
-            a.quat[0] = q.x;
-            a.quat[1] = q.y;
-            a.quat[2] = q.z;
-            a.quat[3] = q.w;
+            // Increment 4 (docs/increment-4-specification.md Appendix A):
+            // the wire quat is JSBSim's own native qAttitudeLocal
+            // (body->NED), read directly - not re-derived from Euler
+            // angles via geo::computeOrientationQuat() - so reconciliation
+            // can reconstruct a VehicleState without a lossy Euler
+            // round-trip.
+            JSBSim::FGQuaternion qLocal = session.getVState().qAttitudeLocal;
+            a.quat[0] = static_cast<float>(qLocal(1));
+            a.quat[1] = static_cast<float>(qLocal(2));
+            a.quat[2] = static_cast<float>(qLocal(3));
+            a.quat[3] = static_cast<float>(qLocal(4));
             // Local frame is East/Up/-North, matching position (Up = -Down).
             a.vel_local_mps[0] = static_cast<float>(sample.vel_east_mps);
             a.vel_local_mps[1] = static_cast<float>(-sample.vel_down_mps);
             a.vel_local_mps[2] = static_cast<float>(-sample.vel_north_mps);
+            a.ang_vel_body_rps[0] =
+                static_cast<float>(session.property("velocities/p-rad_sec"));
+            a.ang_vel_body_rps[1] =
+                static_cast<float>(session.property("velocities/q-rad_sec"));
+            a.ang_vel_body_rps[2] =
+                static_cast<float>(session.property("velocities/r-rad_sec"));
             a.status_flags = 0;
             snap.aircraft.push_back(a);
 
