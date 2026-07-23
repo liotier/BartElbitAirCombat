@@ -23,6 +23,15 @@ the check.
   `flight_test_client --mode prediction` under 100ms latency and 20% loss
   in `scripts/run_tests.sh`.
 
+- [ ] **Increment 5 acceptance criterion 7** — run at least two Godot clients
+  simultaneously (or one Godot client alongside a `flight_test_client
+  --mode multiclient`-simulated peer) and confirm *other* players'
+  aircraft render smoothly via `interpcore` — no visible stutter on
+  ordinary snapshot jitter, no obvious "snap." Not built yet (increment 5
+  is still a draft specification, `docs/increment-5-specification.md`);
+  add the "what's already verified automatically" note here once
+  implemented, matching the increment-4 entry above.
+
 - [ ] **Real joystick/HOTAS input, once implemented** — not built yet (see
   "Not yet scheduled" below). Once it is: confirm a real device's axes map
   sensibly (twist/pedal rudder, throttle slider), that Godot's default SDL

@@ -1,0 +1,246 @@
+# Increment 5 Specification: Multi-Core Server Scaling and Remote-Entity Interpolation
+
+## Status
+
+Revision 2 — reviewed. Supersedes draft 1; the adversarial review that produced this revision is in `docs/increment-5-specification-review.md`, which justifies the changes below finding by finding. This is increment 5 of the derisking sequence (`docs/roadmap.md`), following increment 4's split of the original combined "multiplayer scaling and feel" increment: increment 4 built prediction/reconciliation for the single client and single aircraft increment 3 already had; this increment adds the rest — multiple concurrent clients/aircraft, the server-side parallelism needed to step them, and the remote-entity interpolation needed to render *other* players' aircraft smoothly (increment 4's own aircraft is always predicted, never interpolated; this increment is where interpolation first has a reason to exist).
+
+The following was verified by building and running real code before drafting (details and measured numbers in Appendix B) — several corrected the roadmap's own pre-existing assumptions, and one is a materially bigger finding than anything the roadmap anticipated:
+
+- **The roadmap's "~254 aircraft" ceiling was measured in the wrong context and does not transfer.** It came from increment 2's `FlightSession::step()` cost measured *inside a Godot `_physics_process`*; `flight_server` has no Godot dependency at all. Re-measured standalone: steady-state per-aircraft cost is **~25–29 µs** (not 57.2 µs), giving a single-core **mean-case** ceiling around **290–300 aircraft** — but the **worst-case** ceiling (the number that actually matters for a hard 8,333 µs/tick budget) is much tighter, around **150–200**, because per-tick cost has real variance (Appendix B).
+- **4-thread lockstep-barrier-synchronized stepping is safe** (zero divergence across every configuration tested, N=128–600, T=1–4) and gives ample headroom at any aircraft count this project is likely to target: at N=254 with 4 threads, a tick costs 33% of budget; at N=600, 59%. Scaling is sub-linear (2.36× at T=4, most of the gain arriving by T=3) — consistent with memory-bandwidth/spin-barrier overhead, not a correctness problem.
+- **Review finding B1, corrected here**: the barrier pattern validated above (`probe_multithread2.cpp`) only proves T workers stay in lockstep *with each other* over a *fixed* aircraft count — it never exercised a changing roster or a main thread doing real between-tick work, which is exactly what the real server needs (a client joining mid-session, `ControlInput` command buffers mutated by ENet polling). Draft 1 claimed this pattern could be "ported with no change"; review found that claim false and a literal reading of draft 1 would not correctly handle a second client joining after the first tick had run. The fix — a single `(T+1)`-party barrier (workers **and** main) called once per tick, with shared state mutated only by main strictly *before* its own barrier call and read by workers only *after* their own call returns — is now verified directly (`probe_dynamic_pool.cpp`): a run that adds 15 aircraft at tick 100 and removes 8 at tick 250 produces the exact expected per-worker tick count and zero divergence among aircraft that flew an identical number of ticks, at every thread count tested. See "Server-side concurrency" and Appendix B.
+- **Concurrent `FlightSession` construction (`initialize()`+`trim()`) is safe**, including the previously-untested *mixed* case: new clients onboarding (running `initialize()`+`trim()` for the first time) concurrently with other threads continuously stepping already-flying aircraft produces **zero divergence** among aircraft that flew the same number of ticks. (A first pass at this measurement showed a tiny nonzero divergence, 7.78×10⁻⁵; instrumenting per-thread tick counts showed the four stepping threads had completed different numbers of full sweeps — 8, 17, 10, 13 — because that measurement's loop had no per-tick barrier, so the threads legitimately flew different amounts of simulated time under the onboarding contention. Comparing only aircraft that flew the *same* tick count (guaranteed within one thread's own chunk) gave exactly 0.0. This is the same class of self-caught measurement artifact as the multithread scaling probe below — flagged here rather than silently fixed, since the corrected conclusion, not just the clean final number, is what makes it trustworthy.)
+- **`initialize()`+`trim()` cost is real and non-negligible: ~12 ms** for a new aircraft (first call ~30 ms including a cold-cache effect; steady thereafter at ~6 ms `initialize()` + ~6 ms `trim()`). That is 1.4× a full 120 Hz tick budget — a new client connecting must **not** run this on the tick-stepping path, or every other aircraft stalls at the tick barrier waiting for it.
+- **A previously invisible wire-protocol ceiling, tighter than the CPU one**: ENet's default MTU (1392 bytes, unchanged anywhere in this codebase) combined with today's 54-byte `AircraftState` means a `StateSnapshot` broadcast carrying more than **25 aircraft** exceeds the unreliable-send fragmentation threshold. Reading `enet-src/peer.c`'s `enet_peer_send()` and confirming with a real loopback probe using this project's actual `net::serializeStateSnapshot()` and `NetServer::broadcast()`'s exact call (flags=0): ENet does **not** drop or refuse the oversized "unreliable" packet — it silently re-routes it through `ENET_PROTOCOL_COMMAND_SEND_FRAGMENT | ENET_PROTOCOL_COMMAND_FLAG_ACKNOWLEDGE`, i.e. **silently upgrades it to reliable or acknowledged fragmented delivery**, with no error, no return-code signal, nothing — exactly defeating the reason increment 3 chose the unreliable channel for state snapshots (bounded, drop-don't-queue delivery; see increment 3 spec, "Wire protocol"). This is a bigger practical constraint than the CPU ceiling for any realistic player count and shapes this increment's wire-protocol design directly (see "Wire protocol changes").
+- JSBSim source inspection (`FGFDMExec`, `FGPropagate`, `FGAircraft`) found no hidden shared/static mutable state — the basis for all of the above being safe, not just observed to be safe on the runs tested.
+- ENet source inspection (`callbacks.c`, `host.c`, `protocol.c`) found exactly one process-wide global (a write-once-at-`enet_initialize()` callbacks struct); all other mutable state is caller-owned (`ENetHost*`/`ENetPeer*`), confirming the only real threading constraint is keeping all calls on one `ENetHost` confined to a single thread — already this project's plan.
+
+## Goal
+
+Support multiple concurrently connected clients, each flying their own aircraft, on a server that parallelises the independent per-aircraft physics across CPU cores — because, per the roadmap, single-core stepping cost makes multi-core parallelism a hard requirement at any interesting player count, not an optimisation. Alongside this, give *other* players' aircraft smooth, correct rendering via remote-entity interpolation — the thing increment 4 explicitly deferred because, with one client and one aircraft, there was nothing else to interpolate.
+
+## Non-goals
+
+Explicitly out of scope; must not be implemented:
+
+- Bots or AI-controlled aircraft (increment 7)
+- Swapping the c172x for a WWII aircraft model (increment 6) — see Appendix B's note on why this increment's specific headroom numbers may need re-validating once that swap happens
+- Interest management / visibility culling (not sending a client aircraft outside some relevance radius) — deferred with a concrete trigger, not indefinitely: see "Wire protocol changes" for why chunking (not culling) is this increment's answer to the packet-size ceiling, and "Out of scope" for the numeric threshold at which culling should be revisited
+- Damage, weapons, hit detection, lag compensation (increments 8–9, unchanged)
+- Collision or any other cross-aircraft gameplay interaction — the lockstep tick barrier this increment builds is a *precondition* future increments needing "see every other aircraft's current-tick state" will rely on, but no such interaction is implemented here
+- Persistent player identity or reconnect-to-the-same-slot — a disconnecting client's `player_id` is simply freed and may be reassigned to the next connection
+- Dynamic thread-pool resizing, work-stealing schedulers, or any load-balancing beyond fixed contiguous chunks — unjustified given the measured headroom (Appendix B)
+- Hermite/velocity-tangent-aware curve interpolation for remote entities — simple linear position interpolation and quaternion slerp between two bracketing snapshots is this increment's baseline (see "Remote-entity interpolation"); noted as a possible future refinement, not required now
+- Voice, chat, or other game-layer concerns (unchanged)
+- WWII aircraft, damage, weapons (later increments, unchanged)
+
+## Architecture
+
+### Server-side concurrency
+
+`flight_server` moves from one `FlightSession` stepped inline on the main/network thread to a fixed-size, persistent worker pool stepping every connected aircraft in lockstep, once per tick:
+
+- **Pool size**: `max(1, std::thread::hardware_concurrency() - 1)` worker threads, created once at server startup and kept alive for its entire lifetime (no per-tick thread creation — the cost of that was exactly what the pre-drafting probes were careful to keep out of their own measurements). Reserving one core for the main thread (ENet polling, tick pacing, onboarding dispatch) is nearly free: at N=254, T=3 (2930 µs/tick) is only 1.9 percentage points of budget worse than T=4 (2775 µs/tick) — the measured scaling curve already shows diminishing returns by the third thread, so giving the last core to networking/onboarding instead costs little and avoids the stepping pool and the network thread contending for the same core under load. On a single-core box this floors at 1 worker thread sharing the core with everything else — still correct, just not accelerated, which is the same single-threaded behaviour this project has run since increment 1.
+- **Partitioning**: contiguous chunks, `chunk = ceil(N / T)`, worker *i* steps aircraft `[i·chunk, min(N, (i+1)·chunk))`. **Recomputed fresh every tick from the current aircraft count `N`** — never captured once at thread-creation time — which is what lets the roster grow or shrink while the pool keeps running (see the handoff protocol below; review finding B1).
+- **Per-tick handoff protocol (review finding B1 — this exact protocol is verified, not just described; see Appendix B)**: a single hand-rolled spin-yield barrier (`std::barrier` is C++20; this project is C++17), sized for **all T workers plus the main thread** (T+1 parties), called via `arriveAndWait()` **exactly once per tick by every party** — the standard bulk-synchronous-parallel "superstep" pattern. The discipline that makes this safe with no other synchronization:
+  - **Main mutates shared state only between its own consecutive `arriveAndWait()` calls, and finishes before making the next call.** This covers everything main owns: draining `server.poll()` (which runs `onEvent`, mutating per-client `ControlInput` command buffers), splicing newly-onboarded clients into the active list and removing disconnected ones, and publishing the resulting aircraft count. Building and broadcasting the previous tick's `StateSnapshot` chunks also happens here, since it only needs the *previous* tick's already-complete state.
+  - **Workers read that state only *after* their own `arriveAndWait()` call returns** — recomputing `[lo,hi)` fresh from the just-published count, and popping/applying their own assigned aircraft's next queued `ControlInput` command immediately before stepping it (parallelism-friendly: each worker touches only its own aircrafts' command buffers, and is guaranteed by the barrier that main's `onEvent`-driven writes to those same buffers already finished this round).
+  - This is why a single T-party, workers-only barrier (what `probe_multithread2.cpp` actually validated, and all draft 1 claimed to reuse) is insufficient on its own: it keeps workers in lockstep with *each other*, but gives main no synchronized window to safely touch the roster or the command buffers at all. Adding main as the extra party is what creates that window.
+  - The barrier is required at all, not incidental: the server broadcasts one synchronized snapshot of *all* aircraft after each tick, and a future increment needing aircraft to see each other's current-tick state (collision, weapons) depends on every aircraft having actually completed that tick first.
+  - The active-aircraft list itself is a plain `std::vector` of pointers/handles, rebuilt each between-tick window rather than managed as in-place reusable slots — given realistic client counts (a handful to a few dozen), this is cheap enough that no slot-reuse scheme is worth the added complexity.
+- **Idle cost**: worker threads spin-yield (`std::this_thread::yield()`) between barrier arrivals rather than block on a condition variable — lower latency, and bounded to at most one tick period of yielded waiting even when most workers have nothing assigned that tick. The dispatch loop skips invoking the pool entirely when zero aircraft are active (server up, nobody connected yet — this refers to zero aircraft of any kind, including test-only synthetic ones, not zero real clients specifically), which is the one case where spin-yield overhead would otherwise run unbounded. A condition-variable design would cut idle CPU further but adds latency and complexity not justified at this project's target scale — the boring choice, deliberately.
+
+### Client onboarding (off the hot path)
+
+Because `initialize()`+`trim()` costs ~12 ms — more than one full tick budget — a newly connecting client's `FlightSession` must never be constructed on the main thread or a stepping worker. Onboarding runs on its own short-lived thread, one per connecting client (connections are rare/bursty compared to the steady 120 Hz stepping load, so a persistent onboarding pool is unwarranted complexity):
+
+1. `kClientHello` arrives, passes the existing protocol-version check.
+2. If `reservedSlots < maxClients`: reject with `kServerFull` (generalizing today's single-`clientPeer != nullptr` check to a real count) — a slot is reserved for this connection now, not once onboarding finishes, so two simultaneous connection attempts can't both grab the same free `player_id`.
+3. Allocate the lowest free `player_id` from the fixed pool `[1, maxClients]` and spawn a detached onboarding thread that runs `initialize()` → `setInitialCondition()` (same shared IC every increment has used, lat=0/lon=0 — see "Wire protocol changes" for why this makes a shared world origin free) → `trim()` → a small position offset via `SetLocation()`/`geo::invertLocalOffset()` (reusing the increment-4-proven reconstruction recipe) so simultaneously-spawning aircraft don't land exactly coincident — staggered by `player_id`, a deliberately simple placement rule, not real spawn-point design.
+4. The main thread checks, once per tick, whether any onboarding task has completed (a cheap non-blocking check — e.g. `future::wait_for(0)`). On completion, it splices the new `ConnectedClient` (peer, `player_id`, session, fresh command-buffer state) into the active list and *then* sends `ServerWelcome` — the client-side convention (already established in increments 3–4) of not sending `ControlInput` until `ServerWelcome` arrives means this ordering needs no new client-side logic.
+5. If the peer disconnects while onboarding is still in flight: the onboarding thread is allowed to finish (nothing forcibly cancels it — the cost is bounded, ~12 ms), but its result is discarded and the reserved slot freed immediately on disconnect detection, not held open waiting for a construction that no longer matters.
+
+### Shared world origin and spawn placement
+
+Every aircraft is trimmed at the identical initial condition every increment has used (`setInitialCondition(5000 ft, 100 kt, 0, lat=0, lon=0, 0)`), which increment 4 already confirmed converges bit-identically across separate process/thread invocations. That means the origin `ServerWelcome` announces to every client can stay exactly what it is today — the shared trimmed reference point — with no new "whose origin is authoritative" question to resolve: every aircraft, including the first, is *already* relative to the one shared point by construction. The per-`player_id` spawn offset above (step 3) moves each aircraft a small, deterministic distance from that shared point purely so they don't visually stack; it does not change the origin itself.
+
+## Wire protocol changes
+
+Four changes to increment 4's protocol (`docs/increment-4-specification.md` Appendix A). The first two exist *because of* the MTU finding in "Status" — this is not a hypothetical worst case, it is what happens the moment a snapshot needs to carry more than 25 aircraft with today's field layout, silently and without error.
+
+1. **`StateSnapshot` gains `chunk_index` (`uint8`) and `chunk_count` (`uint8`)**, placed after `server_tick`. A tick's full aircraft list is split into groups of at most `kMaxAircraftPerChunk = 16` (see below) and broadcast as `chunk_count` separate `StateSnapshot` packets sharing the same `server_tick`, each `broadcast()` the same way a single snapshot is today. `kMaxAircraftPerChunk` is chosen with real margin below the measured/computed 23–25-aircraft fragmentation threshold specifically so it survives some future per-aircraft field growth without needing to be re-derived under time pressure: at 16 aircraft, a chunk is 936 bytes against the 1364-byte threshold (69%, ~428 bytes / ~7 aircraft-equivalents of headroom).
+2. **A client processes each chunk independently as it arrives, not as an atomically-reassembled whole snapshot.** Each chunk updates a per-`player_id` "latest known state" table; if one chunk of a tick is lost (still possible — chunks are still sent unreliably), the aircraft in *that* chunk simply keep last tick's state until the next tick's corresponding chunk arrives. This adds no new failure mode: increment 3/4 already require every client to tolerate a dropped snapshot outright, since the whole system runs over an intentionally unreliable channel; tolerating a *partial* drop (some aircraft stale by one tick, others current) is a strictly smaller ask than tolerating a *complete* one, which is already required. This is also why chunking, not reassembly-with-retransmit, is the right fix: it keeps every guarantee at exactly the same (already-accepted) strength as before, rather than introducing a new, stronger, reliable-adjacent guarantee that the unreliable-channel design deliberately avoids elsewhere.
+
+   **Normative (review finding M1)**: reconciliation (`predictcore::PredictedSession::reconcile()`) triggers exactly when the chunk containing the reading client's **own** `player_id` arrives — never gated on whether sibling chunks for the same `server_tick` have also arrived. A client's own `AircraftState` record is never itself split across chunks (only the *list* of aircraft is split), so this is always well-defined. Waiting for "a complete snapshot" before reconciling would silently reintroduce the reassembly-completeness dependency chunking exists to avoid, stalling a client's own reconciliation behind an unrelated chunk carrying only other aircraft.
+3. **`ack_client_seq` moves from `StateSnapshot`'s top level into each `AircraftState`** (immediately after `status_flags`). With multiple clients sharing one broadcast packet, a single top-level scalar cannot carry a distinct acknowledgement per client; per-aircraft placement is the only sensible design once "connection-scoped" and "aircraft-scoped" stop being the same thing (as they trivially were at increment 4's one-client scale — worth noting increment 4's own Appendix A comment, "connection-scoped, not a property of any aircraft," was already close to flagging this). Each client reads the `ack_client_seq` off *its own* `player_id`'s entry (which it already has to find for reconciliation, unchanged from increment 4) and ignores the field on every other aircraft's entry — costing those other clients nothing they weren't already paying (4 bytes on a field they simply don't read). At N=1 this is wire-size-neutral (a global 4-byte field becomes a per-aircraft 4-byte field when there is exactly one aircraft); the relocation costs 4 bytes/aircraft only once there is more than one.
+4. **A new message, `kPlayerLeft` (tag 7): `{uint8 player_id}`**, reliable, broadcast when the server detects a client disconnect. This is simpler and more deterministic than a client-side timeout heuristic for "has this remote aircraft's owner left," and reuses the exact reliable-broadcast mechanism `ServerWelcome`/`ServerReject` already use — no new transport concept, just a new tag and a 1-byte payload. Remote-entity tracking (below) removes that `player_id` immediately on receipt rather than guessing from a gap in snapshots.
+
+A newly-connecting client learns about every *already*-connected aircraft for free, with no special-cased "catch-up" message: the very next `StateSnapshot` (chunk set) it receives already contains every currently active aircraft, exactly as it does for any other tick.
+
+Field-width discipline is unchanged (little-endian, field-by-field, no struct `memcpy`). New `AircraftState` size: 58 bytes (was 54). New `StateSnapshot` base: 8 bytes (tag + `server_tick` + `chunk_index` + `chunk_count` + `aircraft_count`) — 2 bytes *smaller* than increment 4's 10-byte base, since the relocated `ack_client_seq` more than pays for the two new chunk-framing bytes at the packet level.
+
+## Remote-entity interpolation
+
+A new Godot-free library, `interpcore` (`src/interpcore/`), depending only on `netcore` (not `flightcore` — this is the concrete sense in which remote-entity interpolation is simpler than prediction: there is no local `FlightSession` to simulate or reconcile, only already-received wire data to buffer and interpolate between). Shared unmodified by the Godot `RemoteAircraft` node and `flight_test_client`, for the same reason increment 4 shared `predictcore` between `PredictedAircraft` and the test harness: shared code is the only way the automated tests can honestly exercise what the human-facing client does, rather than a parallel reimplementation that could disagree with it for reasons having nothing to do with a real bug.
+
+This is the standard "render slightly in the past" pattern used by real-time multiplayer games since at least the Half-Life/Source engine era (Valve's own networking documentation describes exactly this buffer-and-interpolate scheme) — chosen deliberately as the mature, boring, widely-precedented option rather than inventing something novel, consistent with this project's stated preference.
+
+- **`RemoteEntityTracker`**: owns a small per-`player_id` map, each entry a short history of received `(AircraftState, arrival_time)` pairs (a handful of entries is enough — this only needs to bridge the interpolation delay below, nothing like predictcore's ~10-second reconciliation ring buffer).
+  - `update(player_id, AircraftState, arrival_time)` — called once per received chunk entry, regardless of which chunk it arrived in (see "Wire protocol changes" point 2).
+  - `remove(player_id)` — called on `kPlayerLeft`.
+  - `sample(player_id, render_time) -> InterpolatedState{pos[3], quat[4], valid}` — the rendering-side query.
+- **Interpolation delay**: render remote entities at `now - 100 ms` (starting point, tunable — see "Open questions"). At increment 3/4's established 30 Hz snapshot rate (~33 ms interval), 100 ms is a little over 3 intervals, giving slack to absorb a couple of consecutive dropped chunks before falling back to extrapolation, and happens to match the exact delay this project's own `net_relay --delay-ms 100` testing already uses elsewhere.
+- **Interpolation** (when `render_time` falls between two buffered samples): linear interpolation (`lerp`) on position, spherical linear interpolation (`slerp`) on the quaternion — both standard, well-conditioned operations at the small angular steps one 33 ms tick produces. Converting the wire's native `qAttitudeLocal` to Godot's convention reuses `geo::computeBodyAxesFromQuat()` unchanged (increment 4, verified to 0.0 worst-case difference against the Euler path) — interpolation happens on the already-converted Godot-space quaternion, not on JSBSim-native components, so no new frame algebra is introduced here.
+- **Extrapolation fallback** (when `render_time` is newer than the newest buffered sample — stream start, or catching up after a stall): dead-reckon forward from the last known sample using the wire's own `vel_local_mps` for position (`pos + v·dt`) and a standard first-order quaternion integration for orientation using `ang_vel_body_rps` (`q_new = normalize(q + dt · ½ · q ⊗ ω_quat)`, the same well-precedented small-angle quaternion kinematics used throughout robotics and games — reusing data the wire already carries for reconciliation reconstruction, a happy incidental reuse rather than a new field). Extrapolation is **bounded**: past a capped window (starting point: ~300 ms, roughly 3 missed snapshot intervals — tunable, see "Open questions"), the tracker holds the last extrapolated pose rather than continuing to project forward indefinitely, since an unbounded dead-reckon during a real stall or disconnect would drift arbitrarily far from where the aircraft actually ends up.
+- **A brand-new remote entity (review finding m2)**: the first sample ever received for a `player_id` is, by definition, the only one buffered — no bracketing pair exists yet for interpolation. This needs no special case: it is handled by the same extrapolation path above, treating that single sample as "the last known sample" (`render_time`, always `now - 100 ms`, is never earlier than the first moment a real sample could exist). An implementer should not write a separate branch for this.
+
+### Godot integration
+
+`RemoteAircraft` stops being a single scene-authored node consuming one `NetworkClient` singleton's one `latestAircraft_`. Instead, the scene dynamically instances one `RemoteAircraft` (from a `PackedScene` template) per `player_id` other than the local client's own — spawned the first time that `player_id` appears in a received chunk, freed on `kPlayerLeft`. `NetworkClient` (or a new thin per-connection GDExtension owner, whichever keeps `_ready()`/sibling-lookup wiring simplest — implementer's discretion, document the choice) owns the single `interpcore::RemoteEntityTracker` and feeds it from incoming chunks; each `RemoteAircraft` instance queries `sample(its own player_id, now)` every `_physics_process` and sets its transform directly — no blending needed here the way increment 4's *predicted* aircraft needs it, since there is no "correction" event to smooth over, only a continuously-updated interpolated/extrapolated pose.
+
+## Test plan
+
+Two new test surfaces, following increment 3/4's precedent of validating the shared library directly (fast, deterministic, no live network needed for the algorithm itself) and validating it again through a real end-to-end run (slower, but proves the transport integration).
+
+**`interpcore` unit-level tests** (synthetic data, no `FlightSession`/JSBSim, no network):
+
+1. **Interpolation correctness**: feed a synthetic sequence representing uniform linear motion and uniform rotation at a known rate; assert `sample()` at arbitrary intermediate `render_time`s matches the analytically expected position/orientation within tight tolerance.
+2. **Graceful one-drop handling**: feed the same sequence with one entry skipped; assert interpolation using the next available bracketing pair still produces a smooth, correct result — the whole reason for buffering with a delay in the first place.
+3. **Bounded extrapolation**: feed a sequence, then stop; assert the tracker dead-reckons correctly for the capped window and then holds rather than diverging further.
+4. **Multi-entity independence**: interleave updates for several distinct `player_id`s; assert each tracks correctly with no cross-talk between entities.
+
+**`flight_test_client --mode multiclient`** (new mode, real network, real `flight_server`):
+
+5. **Distinct player IDs, no cross-talk**: connect 3 simulated clients (in-process, each owning a real `net::NetClient`) with distinct, independent input schedules; assert each receives a distinct `assigned_player_id` and that each client's own aircraft responds only to its own input (another client's stick movement never moves the wrong aircraft).
+6. **Capacity and slot reuse**: start the server with a small `--max-clients` (e.g. 3), connect that many, assert a 4th connection attempt receives `kServerFull`; disconnect one, assert a subsequent new connection succeeds and is assigned a valid `player_id`.
+7. **Chunking correctness at scale**: start the server with `--stress-aircraft N` (a new test-only flag adding synthetic, unpiloted, trimmed-and-flying `FlightSession`s purely to inflate the aircraft count — cheap, since construction is one-time and stepping cost is trivial per Appendix B) alongside a few real connected clients. **Synthetic aircraft draw `player_id`s from a range above `maxClients` (starting at 200 — comfortably below `uint8`'s 255 ceiling and above any `maxClients` this project would plausibly configure), never counted against real-client capacity** (review finding M2 — this is what lets `--stress-aircraft` and `--max-clients` be tuned independently without the two colliding). Run at `N` = 30 (comfortably crossing the boundary) **and explicitly at the boundary values 16, 17, and 32** (review finding m1 — exactly one full chunk, one chunk plus a straggler, and exactly two full chunks, the values most likely to expose an off-by-one in the `ceil(N/kMaxAircraftPerChunk)` computation or a chunk-loop bound); assert the client reconstructs the complete, correct aircraft set across chunks for a given tick with no duplicate or missing `player_id`s, and that each real client's own reconciliation (`ack_client_seq` read from its own `AircraftState` entry) still functions correctly post-relocation.
+8. **Live remote-entity tracking**: through the same multi-client run, assert each client's `interpcore`-tracked view of *other* aircraft tracks their true server-side trajectories within a reasonable tolerance and delay.
+9. **Regression test for the MTU finding itself**: assert that a `StateSnapshot` chunk serialized via the real `serializeStateSnapshot()` at exactly `kMaxAircraftPerChunk` aircraft stays at or under the safe unreliable-send threshold — turning the pre-drafting probe that found this into a permanent guard, so a future field added to `AircraftState` without re-checking the chunk budget fails loudly in CI rather than silently degrading delivery semantics in production.
+10. Increment 1–4 suites continue to pass unchanged; `--scenario pitch_response`'s single-aircraft scripted mode is untouched by any of the above.
+
+Following `scripts/run_tests.sh`'s established pattern (`NET3_OVERALL_STATUS`, `NET4_OVERALL_STATUS`), a new `== Running increment 5 concurrency/scaling tests ==` section aggregates into `NET5_OVERALL_STATUS`, folded into the script's final combined exit code.
+
+## Documentation
+
+New C++/GDScript files carry the GPL-3.0 header convention. Design decisions with non-obvious rationale — the async-onboarding split, the mutate-before-call/read-after-return barrier discipline (review finding B1 — the easiest part of this spec to silently violate while refactoring later), the per-aircraft `ack_client_seq` relocation, the chunk-size derivation, the extrapolation bound — get inline comments pointing back to this spec, matching every prior increment's convention.
+
+## Licence
+
+Unchanged: GPL-3.0-or-later. No new third-party dependencies — this increment adds `-pthread`/`Threads::Threads` linkage to `flight_server` (its first use of `std::thread`; `find_package(Threads REQUIRED)` is a standard CMake pattern, already confirmed to compile and link cleanly against this project's existing toolchain via the pre-drafting probes) but no new fetched library.
+
+## Acceptance criteria
+
+Increment 5 is complete when all hold simultaneously:
+
+1. `scripts/run_tests.sh` on a fresh clone exits 0 — increments 1–4 suites unchanged, and every increment-5 assertion in "Test plan" passes.
+2. A server with multiple concurrently connected clients steps every aircraft in true lockstep (all complete tick N before any starts tick N+1), parallelised across a worker pool sized from `std::thread::hardware_concurrency()`, with zero cross-aircraft state divergence attributable to the parallelism itself.
+3. A new client's onboarding (`initialize()`+`trim()`) never blocks or delays the tick loop for already-connected clients — demonstrated by a new connection arriving while other aircraft are actively flying, with no observable tick-time spike attributable to onboarding.
+4. `StateSnapshot` broadcasts correctly chunk aircraft counts above `kMaxAircraftPerChunk`, and the MTU-threshold regression test (test-plan item 9) passes, preventing the silent unreliable-to-reliable fallback identified in "Status" from ever being reintroduced unnoticed.
+5. Remote-entity interpolation produces smooth, correct tracking of other clients' aircraft, tolerates a single dropped chunk without visible disruption, and bounds its extrapolation rather than diverging unboundedly during a stall.
+6. `ServerReject(kServerFull)` and clean slot reuse after disconnect both function correctly with more than one client.
+7. **A human has run at least two Godot clients simultaneously** (or one Godot client alongside a `flight_test_client`-simulated peer) and confirmed *other* players' aircraft render smoothly — no visible stutter on ordinary snapshot jitter, no obvious "snap" — documented as performed, not CI-gated, the same standard increment 4 applied to its own prediction-correction blend (review residual risk 3). The automated suite (test-plan items 1–4, 8) proves tracking correctness and boundedness; it does not prove smoothness looks right to a human, the same distinction increment 4 drew for its own blend.
+8. The GitHub Actions workflow runs to completion within the existing 20-minute budget (the added synthetic-aircraft stress test is cheap per Appendix B; confirm during implementation and raise the budget only if measurement says so).
+9. The README documents the multi-client/multi-core architecture, the wire protocol's chunking, and how to run a multi-client test session.
+
+## Out of scope, explicitly deferred
+
+Everything in increments 1–4's deferred lists, plus: bots (increment 7), the WWII aircraft swap (increment 6), damage/weapons/hit detection (increments 8–9), collision or any other cross-aircraft gameplay interaction, persistent player identity across reconnects, dynamic thread-pool resizing or work-stealing, Hermite/velocity-tangent interpolation curves.
+
+**Interest management / visibility culling** is deferred with a concrete, numeric revisit trigger rather than indefinitely: this increment's chunking design comfortably handles dozens of aircraft (each additional 16 aircraft is one more ~936-byte packet); revisit only if a real target concurrent-aircraft count grows large enough that the resulting chunk count itself becomes a meaningful bandwidth or per-tick serialization concern — not anticipated at any scale this project's "modest hardware," non-Battlebit-scale (aircraft, not infantry) vision implies, but not ruled out forever either.
+
+## Open questions for the implementer
+
+At the implementer's discretion; document the choice:
+
+- `kMaxAircraftPerChunk` (suggested 16): must stay safely under the measured/computed 23–25-aircraft fragmentation threshold with margin for future per-aircraft field growth; 16 was chosen for round-number clarity and ~69%-of-threshold headroom, not derived from a harder constraint.
+- The interpolation delay (suggested 100 ms) and extrapolation bound (suggested ~300 ms): starting points per the same reasoning increment 4 applied to its own correction threshold and blend duration — tune once real multi-client jitter data exists.
+- `--max-clients` default (suggested 8, up from today's hardcoded 4): operator-configurable either way; the CPU/wire-format headroom comfortably supports more, but a modest default avoids over-promising before a real playtest has exercised more than a handful of simultaneous aircraft.
+- Whether `NetworkClient` itself grows to own the new `interpcore::RemoteEntityTracker`, or a new thin GDExtension node takes over that responsibility while `NetworkClient` stays focused on transport — either is workable; document whichever keeps `_ready()`/sibling-lookup wiring simplest.
+- Whether onboarding threads are bare `std::thread`s (simplest) or routed through `std::async`/a `std::future`-returning helper (slightly more idiomatic for the "check if ready" polling step) — no behavioural difference, implementer's discretion.
+
+Not open (settled by pre-drafting validation and review): the wire format **does** relocate `ack_client_seq` to per-aircraft and **does** add chunk framing (the MTU finding is not something a review could plausibly overturn — it is a direct, confirmed-by-loopback-test consequence of ENet's own fragmentation code); onboarding **must** run off the tick-stepping path (the 12 ms measurement is the reason, not a style preference); the per-tick barrier **is** required (the lockstep constraint is inherent to broadcasting one synchronized snapshot, not an implementation detail up for debate); the handoff protocol **is** the single `(T+1)`-party barrier with mutate-before-call/read-after-return discipline (review finding B1 — verified directly against a changing aircraft count, not merely argued for; see Appendix B); reconciliation **does** trigger per-own-chunk-arrival, never gated on snapshot completeness (review finding M1); stress-test aircraft **do** use a `player_id` range separate from real clients' (review finding M2).
+
+---
+
+## Appendix A: message and field reference (normative, updates to increment 4's)
+
+`StateSnapshot` (tag 5), current full layout:
+
+| Field | Wire type | Notes |
+|---|---|---|
+| `server_tick` | `uint32` | unchanged from increment 3 |
+| `chunk_index` | `uint8` | **new**: 0-based index of this chunk within `server_tick`'s broadcast |
+| `chunk_count` | `uint8` | **new**: total chunks for this tick (≥1) |
+| `aircraft_count` | `uint8` | unchanged; count of entries in *this chunk* (≤ `kMaxAircraftPerChunk`) |
+| *(per aircraft)* `player_id` | `uint8` | unchanged |
+| *(per aircraft)* `pos_local_m` | `float32[3]` | unchanged (E, U, −N) |
+| *(per aircraft)* `quat` | `float32[4]` | unchanged from increment 4: JSBSim-native `qAttitudeLocal`, q(1..4) = (w,x,y,z) |
+| *(per aircraft)* `vel_local_mps` | `float32[3]` | unchanged, local frame (E, U, −N) |
+| *(per aircraft)* `ang_vel_body_rps` | `float32[3]` | unchanged: body-frame roll/pitch/yaw rate, rad/s |
+| *(per aircraft)* `status_flags` | `uint8` | unchanged |
+| *(per aircraft)* `ack_client_seq` | `uint32` | **relocated** from `StateSnapshot`'s top level (increment 4) — meaningful only on the entry matching the reading client's own `assigned_player_id`; every other entry's value is ignored by everyone but that aircraft's owning client |
+
+`AircraftState` grows from 54 to 58 bytes; `StateSnapshot`'s base shrinks from 10 to 8 bytes (relocating the 4-byte `ack_client_seq` out more than pays for the 2 new 1-byte chunk fields).
+
+New message, `PlayerLeft` (tag 7):
+
+| Field | Wire type | Notes |
+|---|---|---|
+| `player_id` | `uint8` | the disconnecting client's assigned ID; reliable broadcast |
+
+`ServerWelcome`, `ServerReject`, `ClientHello`, `ControlInput` — **unchanged** in layout from increment 4. `ControlInput`'s redundant-command mechanism (increment 4) is per-connection and needs no change for multiple clients: each client's `ControlInput` stream is already independent, matched to its own connection by ENet's own peer identity, not by anything in the payload.
+
+## Appendix B: measured findings from pre-drafting validation (informative)
+
+Measured on the same class of environment as increments 1–4 (this session: 4-core x86-64 container — `nproc`/`/proc/cpuinfo` confirm 4 logical CPUs, Intel Xeon @ 2.10 GHz — Ubuntu, GCC 13.3.0, JSBSim v1.3.1). All numbers below were re-measured freshly during this increment's own pre-drafting (not carried over from an earlier session's notes) so every figure in this appendix is directly reproducible against the commands shown.
+
+**Standalone single-thread step cost** (`FlightSession::step()`, no Godot, no threading — corrects the roadmap's Godot-context 57.2 µs figure):
+
+| N (aircraft) | mean/tick | worst/tick | % of 8333 µs budget (mean/worst) | per-aircraft mean |
+|---|---|---|---|---|
+| 1 | 10.0 µs | 183.7 µs | 0.1% / 2.2% | 10.03 µs |
+| 50 | 1432.8 µs | 2076.7 µs | 17.2% / 24.9% | 28.66 µs |
+| 150 | 4319.2 µs | 5943.8 µs | 51.8% / 71.3% | 28.79 µs |
+| 200 | 5556.8 µs | 7822.9 µs | 66.7% / **93.9%** | 27.78 µs |
+| 254 | 6340.9 µs | 8096.3 µs | 76.1% / **97.2%** | 24.96 µs |
+| 300 | 8736.2 µs | 11456.0 µs | **104.8%** / 137.5% | 29.12 µs |
+
+Per-aircraft cost is ~9–10 µs cold (N=1, no cache pressure from other instances) and stabilizes around 27–29 µs under steady load — a cache-locality effect, not a measurement error (cross-checked against the multi-thread runs below, which show the same per-aircraft range). **Single-core mean-case ceiling is ~290–300 aircraft; the worst-case ceiling is much tighter, roughly 150–200**, since worst-case tick time is already 94–97% of budget at N=200–254, well before the mean-case figure would suggest trouble.
+
+**4-thread lockstep-barrier-synchronized stepping** (`probe_multithread2.cpp` — a genuine per-tick barrier, matching a real broadcasting server's constraint; corrects a first attempt, `probe_multithread.cpp`, whose no-barrier design let each thread run its assigned aircraft through the whole history independently, producing a faster but unrepresentative number from better cache locality rather than real parallelism):
+
+| N | T=1 | T=2 | T=3 | T=4 | T=4 % of budget |
+|---|---|---|---|---|---|
+| 254 | 6549.0 µs | 3972.1 µs | 2930.2 µs | 2775.1 µs | 33.3% |
+| 300 | — | — | — | 2514.4 µs | 30.2% |
+| 400 | — | — | — | 3369.0 µs | 40.4% |
+| 500 | — | — | — | 4339.1 µs | 52.1% |
+| 600 | — | — | — | 4943.5 µs | 59.3% |
+
+Speedup at N=254 is 1.00× / 1.65× / 2.24× / 2.36× for T=1/2/3/4 — sub-linear, with most of the gain arriving by T=3 (T=4 cuts tick time only 5.3% further versus T=3), consistent with memory-bandwidth or spin-barrier overhead rather than a correctness issue. **Zero divergence** (`worst_lat_diff`/`worst_pitch_diff` exactly 0.0) across every one of these runs. These figures directly informed the "reserve one core for main/networking, use the rest for stepping" architecture choice above: giving up the 4th core costs almost nothing at this scale.
+
+**The corrected per-tick handoff protocol, under a changing aircraft count** (`probe_dynamic_pool.cpp`, added during review — review finding B1): a single `(T+1)`-party barrier (all workers plus main), called once per tick, with shared state (the aircraft list and its published count) mutated by main strictly before its own `arriveAndWait()` call and read by workers only after their own call returns, recomputing `[lo,hi)` fresh every tick. Tested across T=1–4 with 20 aircraft present from tick 0, 15 more spliced in at tick 100, and 8 removed at tick 250 (400 ticks total): every configuration produced the *exact* expected total worker-tick count (400/800/1200/1600 for T=1/2/3/4 — no aircraft skipped, none double-stepped, no out-of-bounds access) and **zero divergence** among aircraft that flew an identical number of ticks. This is what draft 1's architecture section claimed but had not actually tested — `probe_multithread2.cpp` only ever validated a *fixed* N with no main-thread involvement between ticks, which is not the same claim. (An initial version of this same check found a spurious 8.5×10⁻⁴ "divergence" — identical in magnitude at T=1, where no race is even physically possible — because it compared aircraft that had joined at different times, and therefore legitimately flown different numbers of ticks, against each other; restricting the comparison to same-cohort aircraft resolved it, the same class of self-caught artifact as the multithread scaling probe above and the mixed stepping+onboarding finding below.)
+
+**Concurrent construction** (`probe_concurrent_construct.cpp`, 4 threads each running `initialize()`+`trim()` simultaneously): PASS, all four reached identical trimmed state, across 3 repeated runs.
+
+**Mixed concurrent stepping + onboarding** (`probe_mixed_step_trim.cpp`, new this increment): 200 aircraft continuously stepped across 4 threads while 5 more threads simultaneously ran `initialize()`+`trim()` for the first time. Comparing only aircraft that flew an identical number of ticks (guaranteed within one stepping thread's own chunk, since a chunk is stepped as a unit each sweep): **worst-case divergence exactly 0.0**. An initial version of this check compared *all* 200 aircraft against each other regardless of which thread had stepped them, and found a nonzero 7.78×10⁻⁵ divergence; adding per-thread tick counters showed the four stepping threads had completed different numbers of full sweeps (8, 17, 10, 13) under the onboarding contention, since that probe's loop (deliberately, to measure throughput) had no per-tick barrier — the "divergence" was five aircraft-groups having genuinely flown different amounts of simulated time, not corrupted state. This is the same category of self-caught artifact as the multithread scaling probe above, and is recorded here rather than quietly fixed because the corrected reasoning is what makes the final "0.0" figure trustworthy rather than merely asserted.
+
+**`initialize()`+`trim()` cost** (`probe_trim_cost.cpp`, 8 sequential runs): first run 23.07 ms `initialize()` + 7.11 ms `trim()` = 30.18 ms (cold-cache); subsequent runs stabilize at 5.8–8.0 ms `initialize()` + 5.8–6.3 ms `trim()`, total **~12 ms steady-state**. This is 1.4× the 8333 µs tick budget — the direct justification for onboarding running off the tick-stepping path entirely.
+
+**ENet unreliable-packet fragmentation threshold** (`probe_snapshot_mtu.cpp`, new this increment — a real loopback `net::NetServer`/`net::NetClient` pair, real `net::serializeStateSnapshot()`, sent exactly as `NetServer::broadcast()` sends it today, flags=0):
+
+| N (aircraft, today's 54-byte format) | bytes | `ENET_PACKET_FLAG_RELIABLE` observed on receipt |
+|---|---|---|
+| 23 | 1252 | no (genuinely unreliable) |
+| 24 | 1306 | no |
+| 25 | 1360 | no |
+| 30 | 1630 | **yes** (silently upgraded) |
+| 40 | 2170 | yes |
+| 64 | 3466 | yes |
+| 100 | 5410 | yes |
+
+The crossing point (1360 bytes still unreliable, 1630 bytes already reliable) matches the value computed directly from `enet-src/include/enet/protocol.h`'s own struct sizes: `fragmentLength = mtu(1392) − sizeof(ENetProtocolHeader)(4) − sizeof(ENetProtocolSendFragment)(24) = 1364` bytes — confirming both the arithmetic and the real observed behaviour agree, and that neither this project's client nor server code overrides ENet's default MTU anywhere (confirmed via `host.c`/`protocol.c`: both ends default to `ENET_HOST_DEFAULT_MTU`, and negotiation only ever takes the *smaller* of the two sides' values). At today's 54-byte `AircraftState` and 10-byte base, this ceiling is **25 aircraft**; the new 58-byte/8-byte-base format (per "Wire protocol changes") tightens it slightly to 23 — the reason `kMaxAircraftPerChunk` is chosen well below either number, not at the boundary.
+
+### Why this increment's specific headroom numbers may not transfer unchanged to increment 6
+
+All CPU measurements above use the c172x General Aviation trainer, the same airframe every increment since increment 1 has used. Increment 6 swaps this for a real WWII fighter model, which may have a more complex systems/aerodynamics model (multiple gun stations, a more detailed engine model) and therefore a different per-step cost than the ~27–29 µs measured here. The *architecture* (thread pool sized from `hardware_concurrency()`, contiguous chunking, lockstep barrier) does not depend on the specific per-aircraft cost number and needs no redesign; the *specific* headroom figures cited in this appendix (e.g., "N=254 at 33% of budget with 4 threads") should be re-measured once increment 6's aircraft model exists, exactly as this increment re-measured increment 2's own superseded numbers.
