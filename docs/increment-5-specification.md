@@ -26,7 +26,7 @@ Explicitly out of scope; must not be implemented:
 - Bots or AI-controlled aircraft (increment 7)
 - Swapping the c172x for a WWII aircraft model (increment 6) — see Appendix B's note on why this increment's specific headroom numbers may need re-validating once that swap happens
 - Interest management / visibility culling (not sending a client aircraft outside some relevance radius) — deferred with a concrete trigger, not indefinitely: see "Wire protocol changes" for why chunking (not culling) is this increment's answer to the packet-size ceiling, and "Out of scope" for the numeric threshold at which culling should be revisited
-- Damage, weapons, hit detection, lag compensation (increments 8–9, unchanged)
+- Damage, weapons, hit detection, lag compensation (increments 9–10, unchanged)
 - Collision or any other cross-aircraft gameplay interaction — the lockstep tick barrier this increment builds is a *precondition* future increments needing "see every other aircraft's current-tick state" will rely on, but no such interaction is implemented here
 - Persistent player identity or reconnect-to-the-same-slot — a disconnecting client's `player_id` is simply freed and may be reassigned to the next connection
 - Dynamic thread-pool resizing, work-stealing schedulers, or any load-balancing beyond fixed contiguous chunks — unjustified given the measured headroom (Appendix B)
@@ -156,7 +156,7 @@ Increment 5 is complete when all hold simultaneously:
 
 ## Out of scope, explicitly deferred
 
-Everything in increments 1–4's deferred lists, plus: bots (increment 7), the WWII aircraft swap (increment 6), damage/weapons/hit detection (increments 8–9), collision or any other cross-aircraft gameplay interaction, persistent player identity across reconnects, dynamic thread-pool resizing or work-stealing, Hermite/velocity-tangent interpolation curves.
+Everything in increments 1–4's deferred lists, plus: bots (increment 7), the multi-airframe migration (increment 6), multiple aircraft types concurrently (increment 8), damage/weapons/hit detection (increments 9–10), collision or any other cross-aircraft gameplay interaction, persistent player identity across reconnects, dynamic thread-pool resizing or work-stealing, Hermite/velocity-tangent interpolation curves.
 
 **Interest management / visibility culling** is deferred with a concrete, numeric revisit trigger rather than indefinitely: this increment's chunking design comfortably handles dozens of aircraft (each additional 16 aircraft is one more ~936-byte packet); revisit only if a real target concurrent-aircraft count grows large enough that the resulting chunk count itself becomes a meaningful bandwidth or per-tick serialization concern — not anticipated at any scale this project's "modest hardware," non-Battlebit-scale (aircraft, not infantry) vision implies, but not ruled out forever either.
 

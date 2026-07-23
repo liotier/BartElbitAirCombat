@@ -28,7 +28,7 @@ Explicitly out of scope; must not be implemented:
 - Multi-core server parallelism, or any server-side performance work (increment 5)
 - Bit-perfect reconciliation of JSBSim flight-control-system internals (actuators, filters, PIDs) — accepted as a residual divergence kept bounded by the continuous correction stream (see "Status" and Appendix B); only rigid-body state is rewound
 - Patching or forking JSBSim to expose FCS component state — the alternative this increment deliberately does not take
-- Hit detection, lag compensation for weapons, or "favor the shooter" — a related but distinct concern that arrives with weapons (increment 9)
+- Hit detection, lag compensation for weapons, or "favor the shooter" — a related but distinct concern that arrives with weapons (increment 10)
 - Jitter buffers, adaptive interpolation delay, or any smoothing beyond a straightforward fixed-duration blend on the *rendered* transform after a correction
 - Cross-platform/cross-compiler determinism guarantees between client and server (both run the same binary/toolchain in this project's tests; real heterogeneous-hardware determinism is a production concern, not a derisking one)
 - WWII aircraft, damage, weapons (later increments, unchanged)
@@ -164,7 +164,7 @@ Increment 4 is complete when all hold simultaneously:
 
 ## Out of scope, explicitly deferred
 
-Everything in increments 1–3's deferred lists, plus: multiple clients/aircraft and remote-entity interpolation, multi-core server scaling (increment 5), bit-perfect FCS-state reconciliation or JSBSim patching, hit detection/lag compensation (increment 9), jitter buffers or adaptive smoothing beyond a fixed blend, cross-hardware determinism guarantees.
+Everything in increments 1–3's deferred lists, plus: multiple clients/aircraft and remote-entity interpolation, multi-core server scaling (increment 5), bit-perfect FCS-state reconciliation or JSBSim patching, hit detection/lag compensation (increment 10), jitter buffers or adaptive smoothing beyond a fixed blend, cross-hardware determinism guarantees.
 
 ## Open questions for the implementer
 

@@ -28,7 +28,7 @@ Explicitly out of scope; must not be implemented:
 - Any anti-cheat, encryption, authentication, or DDoS mitigation
 - NAT traversal, matchmaking, server discovery, or lobbies
 - WWII aircraft (still c172x; later increment)
-- Weapons, damage, hit detection (increment 8)
+- Weapons, damage, hit detection (increments 9-10)
 - Persistent player accounts or state
 - Production deployment, containerization, or multi-host operation (all testing is localhost)
 

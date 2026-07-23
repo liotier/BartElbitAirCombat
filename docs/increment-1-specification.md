@@ -431,7 +431,7 @@ Considered and deferred to later increments; must not be implemented in incremen
 - WWII aircraft configurations (later increment)
 - Multiple aircraft instances in a single simulation (later increment)
 - Network protocol implementation (increment 3 onwards)
-- Hit detection, weapons, damage modelling (increment 8)
+- Hit detection, weapons, damage modelling (increments 9-10)
 - Visual rendering of any kind (increment 2)
 - Audio (later, possibly never)
 - User input handling (increment 2)

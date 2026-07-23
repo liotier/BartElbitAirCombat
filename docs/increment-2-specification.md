@@ -16,7 +16,7 @@ Explicitly out of scope for this increment; must not be implemented:
 - Any WWII aircraft configuration (still c172x; later increment)
 - Multiple simultaneous aircraft instances (later increment)
 - AI/bot-controlled aircraft (later increment)
-- Weapons, hit detection, damage modelling (increment 8)
+- Weapons, hit detection, damage modelling (increments 9-10)
 - Collision detection or crash physics of any kind
 - Real art assets, textures, or modelled aircraft geometry (placeholder primitives only)
 - Sound or music
@@ -278,7 +278,7 @@ Increment 2 is complete when all of the following hold simultaneously:
 
 ## Out of scope, explicitly deferred
 
-Unchanged from increment 1's deferred list, plus this increment's own non-goals restated: Godot export/packaging, WWII aircraft, multiple aircraft, AI/bots, networking (increment 3 onwards), weapons/damage (increment 8), audio, joystick/HOTAS, collision/crash physics.
+Unchanged from increment 1's deferred list, plus this increment's own non-goals restated: Godot export/packaging, WWII aircraft, multiple aircraft, AI/bots, networking (increment 3 onwards), weapons/damage (increments 9-10), audio, joystick/HOTAS, collision/crash physics.
 
 ## Open questions for the implementer
 
