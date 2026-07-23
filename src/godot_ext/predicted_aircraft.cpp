@@ -15,12 +15,25 @@
 
 #include "predicted_aircraft.h"
 
+#include "geo/aircraft_orientation.h"
+
 #include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/variant/basis.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <enet/enet.h>
 
+#include <chrono>
+
 namespace godot {
+
+namespace {
+double nowSeconds() {
+    return std::chrono::duration<double>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+}  // namespace
 
 void PredictedAircraft::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_server_host", "host"),
@@ -44,6 +57,14 @@ void PredictedAircraft::_bind_methods() {
                          &PredictedAircraft::getCorrectionCount);
     ADD_PROPERTY(PropertyInfo(Variant::INT, "correction_count"), "",
                  "get_correction_count");
+
+    // Increment 5: the only remote-entity method GDScript needs directly -
+    // the dynamic RemoteAircraft spawner polls this each tick to know
+    // which player_ids currently need a node. hasRemote()/
+    // getRemotePosition()/getRemoteOrientation() are called by
+    // RemoteAircraft in C++ and are not bound.
+    ClassDB::bind_method(D_METHOD("get_active_remote_player_ids"),
+                         &PredictedAircraft::getActiveRemotePlayerIds);
 }
 
 void PredictedAircraft::_ready() {
@@ -194,10 +215,34 @@ void PredictedAircraft::handleEvent(const ENetEvent& event) {
             net::StateSnapshot snap;
             if (net::deserializeStateSnapshot(
                     event.packet->data, event.packet->dataLength, snap)) {
+                double arrivalTimeS = nowSeconds();
                 for (const net::AircraftState& a : snap.aircraft) {
-                    if (a.player_id != assignedPlayerId_) continue;
+                    if (a.player_id != assignedPlayerId_) {
+                        // Increment 5 (docs/increment-5-specification.md,
+                        // "Remote-entity interpolation"): every OTHER
+                        // aircraft in this chunk feeds the shared tracker.
+                        // A client's own record is never split across
+                        // chunks, so this loop correctly handles both this
+                        // client's entry and any number of others in the
+                        // same pass, regardless of which chunk they
+                        // arrived in.
+                        remoteTracker_.update(a.player_id, a,
+                                               snap.server_tick, arrivalTimeS);
+                        continue;
+                    }
+                    // Increment 5: ack_client_seq is now a per-aircraft
+                    // field (relocated from StateSnapshot's top level,
+                    // docs/increment-5-specification.md "Wire protocol
+                    // changes" point 3), read off this client's own entry.
+                    // Normative (review finding M1): reconciliation
+                    // triggers exactly when the chunk containing this
+                    // client's own player_id arrives, never gated on
+                    // whether sibling chunks for the same server_tick
+                    // have also arrived - which this loop already
+                    // satisfies, since it acts the instant the matching
+                    // entry is found in whichever chunk carries it.
                     predict::PredictedSession::ReconcileResult result =
-                        predicted_->reconcile(snap.ack_client_seq, a);
+                        predicted_->reconcile(a.ack_client_seq, a);
                     if (result.corrected) {
                         // Re-target rather than restart: blendFrom_
                         // becomes wherever the blend (or the unblended
@@ -209,7 +254,16 @@ void PredictedAircraft::handleEvent(const ENetEvent& event) {
                         blending_ = true;
                         ++correctionCount_;
                     }
-                    break;
+                }
+            }
+            break;
+        }
+        case net::MessageTag::kPlayerLeft: {
+            net::PlayerLeft left;
+            if (net::deserializePlayerLeft(event.packet->data,
+                                            event.packet->dataLength, left)) {
+                if (left.player_id != assignedPlayerId_) {
+                    remoteTracker_.remove(left.player_id);
                 }
             }
             break;
@@ -217,6 +271,53 @@ void PredictedAircraft::handleEvent(const ENetEvent& event) {
         default:
             break;
     }
+}
+
+bool PredictedAircraft::hasRemote(int playerId) const {
+    interp::InterpolatedState s = remoteTracker_.sample(
+        static_cast<uint8_t>(playerId),
+        nowSeconds() - interp::RemoteEntityTracker::kInterpolationDelayS);
+    return s.valid;
+}
+
+Vector3 PredictedAircraft::getRemotePosition(int playerId) const {
+    interp::InterpolatedState s = remoteTracker_.sample(
+        static_cast<uint8_t>(playerId),
+        nowSeconds() - interp::RemoteEntityTracker::kInterpolationDelayS);
+    return Vector3(static_cast<real_t>(s.pos_local_m[0]),
+                   static_cast<real_t>(s.pos_local_m[1]),
+                   static_cast<real_t>(s.pos_local_m[2]));
+}
+
+Quaternion PredictedAircraft::getRemoteOrientation(int playerId) const {
+    interp::InterpolatedState s = remoteTracker_.sample(
+        static_cast<uint8_t>(playerId),
+        nowSeconds() - interp::RemoteEntityTracker::kInterpolationDelayS);
+    // Same native-quat-to-Godot-convention conversion as increment 4's
+    // display path (docs/increment-4-specification.md Appendix A) -
+    // interpcore deliberately stays in the wire's native representation
+    // throughout (see remote_entity_tracker.h's header comment), so this
+    // one-time conversion happens here, at the point closest to
+    // rendering, exactly like FlightAircraft's own transform assembly.
+    geo::BodyAxes axes = geo::computeBodyAxesFromQuat(s.quat[0], s.quat[1],
+                                                        s.quat[2], s.quat[3]);
+    Vector3 right(static_cast<real_t>(axes.right.x),
+                  static_cast<real_t>(axes.right.y),
+                  static_cast<real_t>(axes.right.z));
+    Vector3 up(static_cast<real_t>(axes.up.x), static_cast<real_t>(axes.up.y),
+               static_cast<real_t>(axes.up.z));
+    Vector3 forward(static_cast<real_t>(axes.forward.x),
+                     static_cast<real_t>(axes.forward.y),
+                     static_cast<real_t>(axes.forward.z));
+    return Basis(right, up, -forward).get_rotation_quaternion();
+}
+
+PackedInt32Array PredictedAircraft::getActiveRemotePlayerIds() const {
+    PackedInt32Array out;
+    for (uint8_t id : remoteTracker_.activePlayerIds()) {
+        out.push_back(static_cast<int32_t>(id));
+    }
+    return out;
 }
 
 }  // namespace godot

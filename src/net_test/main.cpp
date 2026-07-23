@@ -36,6 +36,7 @@
 // Per spec review M2, all scenario timing is measured from server_tick
 // (carried on every snapshot) and anchored to the reliable
 // ServerWelcome, never to wall-clock or an unreliable first snapshot.
+#include "interpcore/remote_entity_tracker.h"
 #include "netcore/net_client.h"
 #include "netcore/protocol.h"
 #include "netcore/snapshot_log.h"
@@ -56,10 +57,13 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -89,6 +93,19 @@ struct Config {
     // lagged truth. The comparison's premise only holds on a clean link,
     // so run_tests.sh passes this for its latency-repeat step.
     bool checkEventualAgreement = true; // --skip-eventual-agreement clears this
+
+    // --mode multiclient only (docs/increment-5-specification.md, "Test
+    // plan" items 5-8).
+    int numClients = 3;
+    // After the numClients connections above succeed, attempt one more
+    // and assert it is rejected with kServerFull (test 6) - meaningful
+    // only when the server this runs against was started with
+    // --max-clients == numClients.
+    bool testCapacity = false;
+    // If >0, assert the total distinct player_id count observed across a
+    // full tick's chunks equals this (test 7 - numClients plus whatever
+    // --stress-aircraft count the server under test was started with).
+    int expectTotalAircraft = 0;
 };
 
 Config parseArgs(int argc, char** argv) {
@@ -110,6 +127,9 @@ Config parseArgs(int argc, char** argv) {
         else if (arg == "--reconciliation") cfg.reconciliation = (nextVal() != "off");
         else if (arg == "--force-desync") cfg.forceDesync = true;
         else if (arg == "--skip-eventual-agreement") cfg.checkEventualAgreement = false;
+        else if (arg == "--num-clients") cfg.numClients = std::atoi(nextVal().c_str());
+        else if (arg == "--test-capacity") cfg.testCapacity = true;
+        else if (arg == "--expect-total-aircraft") cfg.expectTotalAircraft = std::atoi(nextVal().c_str());
     }
     return cfg;
 }
@@ -702,9 +722,10 @@ int runPredictionMode(const Config& cfg) {
             // the divergence via reconcile()'s applyCorrection=false path,
             // just never act on it - otherwise there is nothing to assert
             // "persists" against.
+            // Increment 5: ack_client_seq is now a per-aircraft field.
             predict::PredictedSession::ReconcileResult r =
-                predicted.reconcile(snap.ack_client_seq, a, cfg.reconciliation);
-            if (snap.ack_client_seq > kBootstrapWarmupSeq) {
+                predicted.reconcile(a.ack_client_seq, a, cfg.reconciliation);
+            if (a.ack_client_seq > kBootstrapWarmupSeq) {
                 maxPosErrorM = std::max(maxPosErrorM, r.positionErrorM);
                 maxAttErrorDeg = std::max(maxAttErrorDeg, r.attitudeErrorDeg);
             }
@@ -897,6 +918,333 @@ int runPredictionMode(const Config& cfg) {
     return overall ? 0 : 1;
 }
 
+// Increment 5, "Test plan" item 9: assert a StateSnapshot chunk at exactly
+// kMaxAircraftPerChunk aircraft, serialized via the real
+// serializeStateSnapshot(), stays at or under the safe unreliable-send
+// threshold - turning the pre-drafting probe that found the MTU
+// fragmentation ceiling (docs/increment-5-specification.md Appendix B)
+// into a permanent guard, so a future field added to AircraftState
+// without re-checking the chunk budget fails loudly here rather than
+// silently degrading delivery semantics in production. No server
+// connection needed - this is a pure serialization-size check.
+int runMtuRegressionCheck() {
+    // mtu(1392) - sizeof(ENetProtocolHeader)(4) -
+    // sizeof(ENetProtocolSendFragment)(24) = 1364 bytes - computed from
+    // enet-src's own struct sizes and confirmed by direct loopback
+    // measurement during pre-drafting validation (spec Appendix B).
+    constexpr size_t kSafeUnreliableThresholdBytes = 1364;
+
+    net::StateSnapshot snap;
+    snap.server_tick = 12345;
+    snap.chunk_index = 0;
+    snap.chunk_count = 1;
+    for (int i = 0; i < net::kMaxAircraftPerChunk; ++i) {
+        net::AircraftState a;
+        a.player_id = static_cast<uint8_t>(i + 1);
+        snap.aircraft.push_back(a);
+    }
+    net::ByteBuffer payload = net::serializeStateSnapshot(snap);
+    bool ok = payload.size() <= kSafeUnreliableThresholdBytes;
+    std::printf(
+        "mtu_regression: %s (kMaxAircraftPerChunk=%u serialized_bytes=%zu "
+        "threshold=%zu)\n",
+        ok ? "PASS" : "FAIL", net::kMaxAircraftPerChunk, payload.size(),
+        kSafeUnreliableThresholdBytes);
+    return ok ? 0 : 1;
+}
+
+// Increment 5, "Test plan" items 5-8: multiple simulated clients against a
+// real flight_server, in-process (each owns a real net::NetClient, no
+// local FlightSession/prediction - this mode tests the server's
+// multi-client machinery and interpcore's live data path, not
+// reconciliation, which --mode prediction already covers). Checks
+// distinct player-ID assignment, no cross-talk between clients' own
+// aircraft, correct reconstruction of the full aircraft roster across
+// chunked StateSnapshot packets (with --expect-total-aircraft, meant to
+// be run against a server started with --stress-aircraft), and live
+// interpcore-based tracking of *other* clients' aircraft. Optionally (
+// --test-capacity) also exercises kServerFull and slot reuse after a
+// disconnect - meaningful only against a server whose --max-clients
+// equals --num-clients.
+int runMulticlientMode(const Config& cfg) {
+    if (enet_initialize() != 0) {
+        std::fprintf(stderr, "error: enet_initialize failed\n");
+        return 2;
+    }
+
+    struct SimClient {
+        net::NetClient client;
+        uint8_t playerId = 0;
+        double elevatorCmd = 0.0;
+        uint32_t clientSeq = 0;
+        bool haveSelf = false;
+        float startAltM = 0.0f;
+        float latestAltM = 0.0f;
+        interp::RemoteEntityTracker tracker;
+        std::map<uint8_t, float> lastOtherAltM;
+    };
+    struct TickAccum {
+        uint32_t tick = 0;
+        std::vector<uint8_t> ids;
+        bool started = false;
+    };
+
+    int n = std::max(1, cfg.numClients);
+    std::vector<std::unique_ptr<SimClient>> clients(n);
+    // Two clearly-opposite, easily distinguishable constant elevator
+    // commands (alternating if numClients > 2) - deliberately not a
+    // three-way up/down/level pattern, since "level" would need the
+    // client to reproduce the server's own trimmed elevator value (not
+    // necessarily 0) to actually stay level; two opposite directions are
+    // enough to prove no cross-talk and avoid that assumption entirely.
+    for (int i = 0; i < n; ++i) {
+        clients[i] = std::make_unique<SimClient>();
+        clients[i]->elevatorCmd = (i % 2 == 0) ? -0.8 : 0.8;
+        std::string err;
+        if (!clients[i]->client.connect(cfg.host, cfg.port, err)) {
+            std::fprintf(stderr, "error: client %d connect failed: %s\n", i,
+                         err.c_str());
+            enet_deinitialize();
+            return 2;
+        }
+    }
+
+    bool allConnected = true;
+    for (auto& c : clients) {
+        allConnected = waitForConnect(c->client, 5000) && allConnected;
+    }
+    std::printf("all_connected: %s\n", allConnected ? "PASS" : "FAIL");
+    if (!allConnected) {
+        for (auto& c : clients) c->client.stop();
+        enet_deinitialize();
+        return 1;
+    }
+
+    bool allWelcomed = true;
+    std::vector<uint8_t> assignedIds;
+    for (auto& c : clients) {
+        HandshakeOutcome hs = doHandshake(c->client, net::kProtocolVersion, 5000);
+        if (hs.result != HandshakeResult::kWelcome) {
+            allWelcomed = false;
+            continue;
+        }
+        c->playerId = hs.welcome.assigned_player_id;
+        assignedIds.push_back(c->playerId);
+    }
+    std::printf("all_welcomed: %s\n", allWelcomed ? "PASS" : "FAIL");
+    if (!allWelcomed) {
+        for (auto& c : clients) c->client.stop();
+        enet_deinitialize();
+        return 1;
+    }
+
+    std::vector<uint8_t> sortedIds = assignedIds;
+    std::sort(sortedIds.begin(), sortedIds.end());
+    bool distinctIds =
+        std::adjacent_find(sortedIds.begin(), sortedIds.end()) == sortedIds.end();
+    std::printf("distinct_player_ids: %s (ids=", distinctIds ? "PASS" : "FAIL");
+    for (uint8_t id : assignedIds) std::printf("%u ", id);
+    std::printf(")\n");
+
+    std::vector<TickAccum> accum(n);
+    auto nowS = []() {
+        return std::chrono::duration<double>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+
+    std::vector<std::function<void(const ENetEvent&)>> handlers(n);
+    for (int i = 0; i < n; ++i) {
+        handlers[i] = [&, i](const ENetEvent& event) {
+            if (event.type != ENET_EVENT_TYPE_RECEIVE) return;
+            net::MessageTag tag;
+            if (!net::peekMessageTag(event.packet->data, event.packet->dataLength,
+                                      tag)) {
+                return;
+            }
+            SimClient& sc = *clients[i];
+            if (tag == net::MessageTag::kPlayerLeft) {
+                net::PlayerLeft left;
+                if (net::deserializePlayerLeft(event.packet->data,
+                                                event.packet->dataLength, left)) {
+                    sc.tracker.remove(left.player_id);
+                }
+                return;
+            }
+            if (tag != net::MessageTag::kStateSnapshot) return;
+            net::StateSnapshot snap;
+            if (!net::deserializeStateSnapshot(event.packet->data,
+                                                event.packet->dataLength, snap)) {
+                return;
+            }
+            TickAccum& ta = accum[i];
+            if (!ta.started || snap.server_tick != ta.tick) {
+                ta.tick = snap.server_tick;
+                ta.ids.clear();
+                ta.started = true;
+            }
+            for (const net::AircraftState& a : snap.aircraft) {
+                ta.ids.push_back(a.player_id);
+                if (a.player_id == sc.playerId) {
+                    sc.haveSelf = true;
+                    sc.latestAltM = a.pos_local_m[1];
+                } else {
+                    sc.tracker.update(a.player_id, a, snap.server_tick, nowS());
+                    sc.lastOtherAltM[a.player_id] = a.pos_local_m[1];
+                }
+            }
+        };
+    }
+
+    const auto testDuration = std::chrono::milliseconds(4000);
+    auto start = std::chrono::steady_clock::now();
+    auto lastInputSend = start - std::chrono::milliseconds(100);
+    bool recordedStartAlt = false;
+
+    while (std::chrono::steady_clock::now() - start < testDuration) {
+        for (int i = 0; i < n; ++i) clients[i]->client.poll(0, handlers[i]);
+
+        if (!recordedStartAlt) {
+            bool allHaveSelf = true;
+            for (auto& c : clients) allHaveSelf = allHaveSelf && c->haveSelf;
+            if (allHaveSelf) {
+                for (auto& c : clients) c->startAltM = c->latestAltM;
+                recordedStartAlt = true;
+            }
+        }
+
+        if (std::chrono::steady_clock::now() - lastInputSend >=
+            std::chrono::milliseconds(8)) {
+            lastInputSend = std::chrono::steady_clock::now();
+            for (auto& c : clients) {
+                net::ControlInput input;
+                input.newest_client_seq = ++c->clientSeq;
+                net::ControlCommand cmd;
+                cmd.elevator = net::encodeAxis(c->elevatorCmd);
+                cmd.aileron = 0;
+                cmd.rudder = 0;
+                cmd.throttle = net::encodeThrottle(1.0);
+                input.commands.push_back(cmd);
+                c->client.send(net::kChannelUnreliable,
+                               net::serializeControlInput(input), false);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // Test 5: no cross-talk - each client's OWN altitude trend must match
+    // ITS OWN commanded elevator direction, never another client's.
+    bool crossTalkOk = true;
+    for (auto& c : clients) {
+        double delta = c->latestAltM - c->startAltM;
+        bool expectClimb = c->elevatorCmd < 0.0;
+        bool ok = expectClimb ? (delta > 5.0) : (delta < -5.0);
+        crossTalkOk = crossTalkOk && ok;
+        std::printf(
+            "  player_id=%u elevator=%.2f start_alt_m=%.2f end_alt_m=%.2f "
+            "delta_m=%.2f %s\n",
+            c->playerId, c->elevatorCmd, c->startAltM, c->latestAltM, delta,
+            ok ? "ok" : "WRONG-DIRECTION");
+    }
+    std::printf("no_cross_talk: %s\n", crossTalkOk ? "PASS" : "FAIL");
+
+    // Test 7: total aircraft count / no duplicates across chunks, from
+    // the last fully-accumulated tick each client saw.
+    bool countOk = true;
+    if (cfg.expectTotalAircraft > 0) {
+        for (int i = 0; i < n; ++i) {
+            std::vector<uint8_t> ids = accum[i].ids;
+            std::sort(ids.begin(), ids.end());
+            bool noDup = std::adjacent_find(ids.begin(), ids.end()) == ids.end();
+            bool countMatch =
+                static_cast<int>(ids.size()) == cfg.expectTotalAircraft;
+            if (!noDup || !countMatch) countOk = false;
+            std::printf(
+                "  client %d: observed %zu aircraft (expected %d) no_dup=%s\n",
+                i, ids.size(), cfg.expectTotalAircraft, noDup ? "yes" : "NO");
+        }
+        std::printf("chunked_aircraft_count: %s\n", countOk ? "PASS" : "FAIL");
+    }
+
+    // Test 8: live remote-entity tracking - client 0's tracker (fed only
+    // from its own received chunks) should track the other clients'
+    // altitudes within a reasonable tolerance and delay.
+    bool trackingOk = true;
+    if (n >= 2) {
+        double renderT = nowS() - interp::RemoteEntityTracker::kInterpolationDelayS;
+        for (int j = 1; j < n; ++j) {
+            interp::InterpolatedState s =
+                clients[0]->tracker.sample(clients[j]->playerId, renderT);
+            auto it = clients[0]->lastOtherAltM.find(clients[j]->playerId);
+            bool haveRaw = it != clients[0]->lastOtherAltM.end();
+            bool ok = s.valid && haveRaw &&
+                      std::fabs(s.pos_local_m[1] - it->second) < 10.0;
+            trackingOk = trackingOk && ok;
+            std::printf(
+                "  tracked player_id=%u tracked_alt_m=%.2f raw_alt_m=%.2f "
+                "valid=%d\n",
+                clients[j]->playerId, s.pos_local_m[1],
+                haveRaw ? it->second : 0.0f, s.valid);
+        }
+    }
+    std::printf("live_remote_tracking: %s\n", trackingOk ? "PASS" : "FAIL");
+
+    bool overall = distinctIds && crossTalkOk && countOk && trackingOk;
+
+    if (cfg.testCapacity) {
+        std::string err;
+        net::NetClient extra;
+        bool capacityOk = false;
+        if (extra.connect(cfg.host, cfg.port, err) && waitForConnect(extra, 3000)) {
+            HandshakeOutcome hs = doHandshake(extra, net::kProtocolVersion, 3000);
+            capacityOk =
+                hs.result == HandshakeResult::kReject &&
+                hs.reject.reason_code ==
+                    static_cast<uint8_t>(net::RejectReason::kServerFull);
+        }
+        std::printf("capacity_reject: %s\n", capacityOk ? "PASS" : "FAIL");
+        extra.stop();
+
+        // Free client 0's slot, then verify a fresh connection succeeds.
+        clients[0]->client.send(net::kChannelReliable, net::serializeClientBye(),
+                                 true);
+        clients[0]->client.flush();
+        clients[0]->client.disconnect();
+        waitForDisconnect(clients[0]->client, 3000);
+        clients[0]->client.stop();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        net::NetClient reconnect;
+        bool slotReuseOk = false;
+        if (reconnect.connect(cfg.host, cfg.port, err) &&
+            waitForConnect(reconnect, 3000)) {
+            HandshakeOutcome hs =
+                doHandshake(reconnect, net::kProtocolVersion, 3000);
+            slotReuseOk = hs.result == HandshakeResult::kWelcome;
+        }
+        std::printf("slot_reuse: %s\n", slotReuseOk ? "PASS" : "FAIL");
+        reconnect.send(net::kChannelReliable, net::serializeClientBye(), true);
+        reconnect.flush();
+        reconnect.disconnect();
+        waitForDisconnect(reconnect, 2000);
+        reconnect.stop();
+
+        overall = overall && capacityOk && slotReuseOk;
+    }
+
+    for (auto& c : clients) {
+        if (c->client.isConnected()) {
+            c->client.send(net::kChannelReliable, net::serializeClientBye(), true);
+            c->client.flush();
+            c->client.disconnect();
+            waitForDisconnect(c->client, 2000);
+        }
+        c->client.stop();
+    }
+    enet_deinitialize();
+    return overall ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -910,6 +1258,10 @@ int main(int argc, char** argv) {
         rc = runVersionReject(cfg);
     } else if (cfg.mode == "prediction") {
         rc = runPredictionMode(cfg);
+    } else if (cfg.mode == "multiclient") {
+        rc = runMulticlientMode(cfg);
+    } else if (cfg.mode == "mtu_regression") {
+        rc = runMtuRegressionCheck();
     } else {
         std::fprintf(stderr, "error: unknown --mode '%s'\n", cfg.mode.c_str());
         return 2;

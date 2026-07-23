@@ -39,10 +39,14 @@ void writeSnapshotCsvHeader(std::ostream& out);
 void writeSnapshotCsvRow(std::ostream& out, const StateSnapshot& snap);
 
 // One CSV row, flattened back out of its aircraft's fields for
-// convenient tick-keyed comparison.
+// convenient tick-keyed comparison. Increment 5: ack_client_seq moved into
+// AircraftState (protocol.h) since it is now a per-aircraft wire field, so
+// it no longer needs a separate column here - `state.ack_client_seq`
+// carries it. chunk_index/chunk_count are transport framing, not aircraft
+// state, and are deliberately not logged: a tick's rows are the same set
+// of per-aircraft records regardless of how many packets carried them.
 struct LoggedAircraftRow {
     uint32_t server_tick;
-    uint32_t ack_client_seq;
     AircraftState state;
 };
 

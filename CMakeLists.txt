@@ -19,6 +19,11 @@ project(BartElbitAirCombat CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Increment 5: flight_server's first use of std::thread/std::async (the
+# worker pool and async client onboarding, docs/increment-5-specification.md
+# "Architecture"). A standard CMake pattern; no new fetched dependency.
+find_package(Threads REQUIRED)
+
 # Open question (increment 1 spec, "Open questions for the implementer"):
 # build configuration. Chosen: Release uniformly, since there is no
 # debugging need for a derisking increment and the CI time budget favours
@@ -115,11 +120,10 @@ target_compile_options(flightcore PRIVATE -Wall -Wextra)
 add_library(flight_gdext SHARED
     src/godot_ext/register_types.cpp
     src/godot_ext/flight_aircraft.cpp
-    src/godot_ext/network_client.cpp
     src/godot_ext/remote_aircraft.cpp
     src/godot_ext/predicted_aircraft.cpp
 )
-target_link_libraries(flight_gdext PRIVATE flightcore netcore predictcore godot::cpp)
+target_link_libraries(flight_gdext PRIVATE flightcore netcore predictcore interpcore godot::cpp)
 target_compile_options(flight_gdext PRIVATE -Wall -Wextra)
 set_target_properties(flight_gdext PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/godot/bin"
@@ -130,8 +134,8 @@ set_target_properties(flight_gdext PROPERTIES
 # ENet (spec, "Architecture"). Defines the wire message types and their
 # serialization (protocol.h/.cpp) plus thin ENet host wrappers
 # (net_server, net_client), shared unmodified by flight_server,
-# flight_test_client, and flight_gdext's NetworkClient node so all three
-# compile the identical serialization code and therefore speak
+# flight_test_client, and flight_gdext's PredictedAircraft node so all
+# three compile the identical serialization code and therefore speak
 # byte-identical wire format.
 add_library(netcore STATIC
     src/netcore/protocol.cpp
@@ -166,12 +170,37 @@ add_executable(predictcore_tests
 target_link_libraries(predictcore_tests PRIVATE predictcore flightcore)
 target_compile_options(predictcore_tests PRIVATE -Wall -Wextra)
 
+# increment 5: interpcore, a Godot-free static library depending only on
+# netcore (spec, "Remote-entity interpolation") - unlike predictcore, there
+# is no local FlightSession to simulate or reconcile, only already-received
+# wire data to buffer and interpolate between, so this needs neither
+# flightcore nor geo::. Defines RemoteEntityTracker, shared unmodified by
+# the Godot client (PredictedAircraft, which also owns the local player's
+# own prediction) and flight_test_client's --mode multiclient.
+add_library(interpcore STATIC
+    src/interpcore/remote_entity_tracker.cpp
+)
+target_include_directories(interpcore PUBLIC src)
+target_link_libraries(interpcore PUBLIC netcore)
+target_compile_options(interpcore PRIVATE -Wall -Wextra)
+
+# The interpcore unit tests (spec, "Test plan" items 1-4) - synthetic data,
+# no FlightSession/JSBSim, no network. Godot-free; links interpcore +
+# netcore only.
+add_executable(interpcore_tests
+    src/interpcore/interp_tests.cpp
+)
+target_link_libraries(interpcore_tests PRIVATE interpcore netcore)
+target_compile_options(interpcore_tests PRIVATE -Wall -Wextra)
+
 # The standalone authoritative server (spec, "Server (flight_server)").
-# No Godot dependency - links flightcore (FlightSession) and netcore only.
+# No Godot dependency - links flightcore (FlightSession), netcore, and
+# Threads (the worker pool + async onboarding, increment 5's first use of
+# std::thread in this project).
 add_executable(flight_server
     src/server/main.cpp
 )
-target_link_libraries(flight_server PRIVATE flightcore netcore)
+target_link_libraries(flight_server PRIVATE flightcore netcore Threads::Threads)
 target_compile_options(flight_server PRIVATE -Wall -Wextra)
 
 # The automated network test harness (spec, "flight_test_client"):
@@ -179,10 +208,11 @@ target_compile_options(flight_server PRIVATE -Wall -Wextra)
 # --mode prediction, which runs a real PredictedSession (predictcore) and
 # therefore needs flightcore too - increments 1-3's modes remain
 # Godot-free/physics-free (netcore only, evaluating physics server-side).
+# Increment 5 adds --mode multiclient, which also needs interpcore.
 add_executable(flight_test_client
     src/net_test/main.cpp
 )
-target_link_libraries(flight_test_client PRIVATE netcore predictcore flightcore)
+target_link_libraries(flight_test_client PRIVATE netcore predictcore interpcore flightcore Threads::Threads)
 target_compile_options(flight_test_client PRIVATE -Wall -Wextra)
 
 # Userspace UDP relay proxy for latency/loss testing (spec, "Network

@@ -13,13 +13,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// The standalone authoritative server (docs/increment-3-specification.md,
-// "Server (flight_server)"). No Godot dependency: links flightcore (the
-// FlightSession JSBSim wrapper, unchanged from increments 1-2) and
-// netcore (the wire protocol). Runs a wall-clock-paced 120 Hz loop,
-// applying the connected client's most recent ControlInput (networked
-// mode) or a built-in scripted schedule (scripted-scenario mode,
-// --scenario), and broadcasts StateSnapshots at a configurable rate.
+// The standalone authoritative server (docs/increment-5-specification.md,
+// "Architecture"). No Godot dependency: links flightcore (the
+// FlightSession JSBSim wrapper) and netcore (the wire protocol). Steps
+// every active aircraft in lockstep across a persistent worker pool, once
+// per wall-clock-paced 120 Hz tick, and broadcasts the result as one or
+// more chunked StateSnapshots. Supports multiple concurrently connected
+// clients (networked mode) or a single scripted-input aircraft
+// (--scenario, unchanged in spirit since increment 3 - this mode never
+// touches the worker pool's multi-client bookkeeping at all).
 //
 // Exit codes match increments 1-2's convention: 0 clean, 1 a criterion
 // failed (scripted mode only), 2 an init/bind/trim execution error.
@@ -29,11 +31,15 @@
 #include "netcore/snapshot_log.h"
 #include "test_runner.h"
 
+#include "FGFDMExec.h"
+#include "math/FGLocation.h"
 #include "math/FGQuaternion.h"
+#include "models/FGPropagate.h"
 
 #include <enet/enet.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -41,9 +47,13 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <map>
+#include <memory>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -55,6 +65,17 @@ struct Config {
     int snapshotHz = 30;
     std::string scenario;  // empty => networked mode
     std::string logName;   // empty => derive from mode/scenario
+    // Increment 5 ("Wire protocol changes" / "Open questions"): real
+    // client capacity. Suggested default 8 (up from increment 3-4's
+    // hardcoded 4) - the CPU/wire-format headroom comfortably supports
+    // more; a modest default avoids over-promising before a real
+    // playtest.
+    int maxClients = 8;
+    // Increment 5 test-only flag: synthetic, unpiloted, trimmed-and-
+    // flying aircraft purely to inflate the aircraft count for chunking-
+    // boundary testing (spec, "Test plan" item 7) - never counted against
+    // maxClients, never touched by any client's input.
+    int stressAircraft = 0;
 };
 
 Config parseArgs(int argc, char** argv) {
@@ -72,9 +93,140 @@ Config parseArgs(int argc, char** argv) {
             cfg.scenario = nextVal();
         } else if (arg == "--log-name") {
             cfg.logName = nextVal();
+        } else if (arg == "--max-clients") {
+            cfg.maxClients = std::atoi(nextVal().c_str());
+        } else if (arg == "--stress-aircraft") {
+            cfg.stressAircraft = std::atoi(nextVal().c_str());
         }
     }
     return cfg;
+}
+
+// Hand-rolled spin-yield barrier (std::barrier is C++20; this project is
+// C++17). Sized for T workers + main (T+1 parties total), called via
+// arriveAndWait() exactly once per tick by EVERY party - the bulk-
+// synchronous-parallel "superstep" pattern verified in
+// docs/increment-5-specification.md Appendix B (probe_dynamic_pool.cpp,
+// review finding B1). The discipline that makes this safe with no other
+// synchronization: main mutates shared state (the aircraft roster, each
+// client's command buffer via ENet polling) only between its own
+// consecutive arriveAndWait() calls, complete before the next call;
+// workers read that state only after their own arriveAndWait() returns,
+// recomputing their chunk boundary fresh from the current roster size
+// every tick.
+class SpinBarrier {
+public:
+    explicit SpinBarrier(int count) : count_(count), waiting_(count) {}
+    void arriveAndWait() {
+        int gen = generation_.load(std::memory_order_relaxed);
+        if (waiting_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            waiting_.store(count_, std::memory_order_relaxed);
+            generation_.fetch_add(1, std::memory_order_release);
+        } else {
+            while (generation_.load(std::memory_order_acquire) == gen) {
+                std::this_thread::yield();
+            }
+        }
+    }
+
+private:
+    int count_;
+    std::atomic<int> waiting_;
+    std::atomic<int> generation_{0};
+};
+
+// Per-connection ordered command buffer (increment 4, "Wire protocol
+// changes" / review finding B2), now one instance per connected client
+// instead of one server-global instance. pendingCommands holds received-
+// but-not-yet-applied commands keyed by client_seq; nextExpectedSeq is the
+// next one the server needs; highestSeqSeen is the highest
+// newest_client_seq any packet from this client has ever reported, used
+// to detect a seq that can never arrive anymore.
+struct CommandBuffer {
+    std::map<uint32_t, net::ControlCommand> pending;
+    uint32_t nextExpectedSeq = 1;
+    uint32_t highestSeqSeen = 0;
+    net::ControlCommand lastApplied{};
+    bool hasInput = false;
+};
+
+enum class AircraftKind { kScripted, kClient, kStress };
+
+// One active, currently-stepping aircraft. Owned exclusively by the main
+// thread's roster (`aircraft` in main()) and mutated only between barrier
+// calls (see SpinBarrier's comment) - workers read/step their assigned
+// slice each tick but never resize or reorder the roster itself.
+struct Aircraft {
+    AircraftKind kind;
+    uint8_t playerId = 0;
+    std::unique_ptr<inc1::FlightSession> session;
+    ENetPeer* peer = nullptr;  // kClient only
+    CommandBuffer cmdBuf;      // kClient only
+};
+
+// A client whose FlightSession is being constructed off the tick-stepping
+// path (docs/increment-5-specification.md, "Client onboarding" - the
+// ~12 ms initialize()+trim() cost measured in Appendix B is more than one
+// full tick budget). `cancelled` is set if the peer disconnects while
+// still in flight; the future is still always consumed (never abandoned)
+// since a std::async future's destructor blocks until the task completes.
+struct PendingOnboard {
+    ENetPeer* peer = nullptr;
+    uint8_t playerId = 0;
+    bool cancelled = false;
+    std::future<std::unique_ptr<inc1::FlightSession>> future;
+};
+
+// Shifts `session`'s position by a local (east_m, north_m) offset from
+// (originLatDeg, originLonDeg), leaving velocity/attitude/body-rates
+// untouched (a freshly-trimmed session's are already correct in isolation
+// - only the location needs to move). A strict subset of predictcore's
+// reconstructAndApply() recipe (docs/increment-4-specification.md,
+// "Reconstruction gate"): same FGLocation-copy-then-SetPositionGeodetic()-
+// then-SetLocation() core, without touching qAttitudeECI/vUVW/vPQR, which
+// this use case never needs to change.
+void offsetSessionPosition(inc1::FlightSession& session, double eastM,
+                            double northM, double originLatDeg,
+                            double originLonDeg) {
+    using JSBSim::FGLocation;
+    geo::GeodeticPos pos =
+        geo::invertLocalOffset(eastM, northM, originLatDeg, originLonDeg);
+    auto P = session.fdm().GetPropagate();
+    double altFt = P->GetVState().vLocation.GetGeodAltitude();
+    FGLocation loc = P->GetVState().vLocation;  // copies the ellipsoid setup
+    loc.SetPositionGeodetic(pos.lon_deg * (M_PI / 180.0),
+                             pos.lat_deg * (M_PI / 180.0), altFt);
+    P->SetLocation(loc);
+}
+
+// Runs entirely on an onboarding thread (std::async), off the main/
+// tick-stepping path: initialize()+trim() at the shared IC every increment
+// has used, then a small per-player_id east offset so simultaneously-
+// spawning aircraft don't land exactly coincident (docs/increment-5-
+// specification.md, "Shared world origin and spawn placement" - a
+// deliberately simple placement rule, not real spawn-point design).
+// Returns nullptr on failure (init/trim non-convergence - not observed in
+// this project's history for this fixed IC, but handled rather than
+// assumed away).
+std::unique_ptr<inc1::FlightSession> onboardNewAircraft(uint8_t playerId,
+                                                          double originLat,
+                                                          double originLon) {
+    auto s = std::make_unique<inc1::FlightSession>();
+    std::string error;
+    if (!s->initialize(error)) {
+        std::fprintf(stderr, "error: onboarding init failed: %s\n",
+                     error.c_str());
+        return nullptr;
+    }
+    s->setInitialCondition(5000.0, 100.0, 0.0, 0.0, 0.0, 0.0);
+    if (!s->trim(error)) {
+        std::fprintf(stderr, "error: onboarding trim failed: %s\n",
+                     error.c_str());
+        return nullptr;
+    }
+    double eastOffsetM = 50.0 * static_cast<double>(playerId - 1);
+    offsetSessionPosition(*s, eastOffsetM, 0.0, originLat, originLon);
+    return s;
 }
 
 }  // namespace
@@ -85,8 +237,8 @@ int main(int argc, char** argv) {
 
     // Increment 1's stray-output-file issue (c172x's own <output> block
     // opens a CSV during LoadModel(), before DisableOutput() runs) applies
-    // here identically, since FlightSession::initialize() is unchanged;
-    // contained the same way (src/main.cpp): run from within results/.
+    // here identically; contained the same way (src/main.cpp): run from
+    // within results/.
     std::error_code ec;
     std::filesystem::create_directories("results", ec);
     std::filesystem::current_path("results", ec);
@@ -97,13 +249,9 @@ int main(int argc, char** argv) {
     }
 
     if (scripted && config.scenario != "pitch_response") {
-        // Increment 3 spec review M3: full-flight scenario reuse mostly
-        // re-proves already-proven physics; one server-side scenario is
-        // enough to validate the new wall-clock loop, so only the one
-        // the spec itself suggests is wired up here.
         std::fprintf(stderr,
                       "error: unsupported --scenario '%s' (only "
-                      "pitch_response is wired up in increment 3)\n",
+                      "pitch_response is wired up)\n",
                       config.scenario.c_str());
         return 2;
     }
@@ -111,25 +259,26 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
-    inc1::FlightSession session;
+    // A one-time reference trim purely to establish the shared world
+    // origin (docs/increment-5-specification.md, "Shared world origin and
+    // spawn placement"): every aircraft (scripted, client, or stress) is
+    // trimmed at the identical IC, which increment 4 already confirmed
+    // converges bit-identically across separate invocations, so this
+    // reference point is valid for all of them regardless of whether this
+    // exact session becomes an active aircraft (scripted mode) or is
+    // discarded once its origin is read (networked mode).
+    auto originSession = std::make_unique<inc1::FlightSession>();
     std::string error;
-    if (!session.initialize(error)) {
+    if (!originSession->initialize(error)) {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return 2;
     }
-    // Same initial condition as increments 1-2's Test 1 / default scene,
-    // for both modes - scripted mode additionally reuses pitch_response's
-    // exact control-input schedule and duration below.
-    session.setInitialCondition(5000.0, 100.0, 0.0, 0.0, 0.0, 0.0);
-    if (!session.trim(error)) {
+    originSession->setInitialCondition(5000.0, 100.0, 0.0, 0.0, 0.0, 0.0);
+    if (!originSession->trim(error)) {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return 2;
     }
-
-    // The trimmed starting position becomes the session origin announced
-    // in ServerWelcome, matching FlightAircraft's reference-point
-    // convention (increment 2).
-    inc1::FlightSample originSample = session.sample();
+    inc1::FlightSample originSample = originSession->sample();
     double originLat = originSample.lat_deg;
     double originLon = originSample.lon_deg;
 
@@ -150,41 +299,76 @@ int main(int argc, char** argv) {
         return 2;
     }
     net::NetServer server;
-    // maxClients > 1 so a second connection attempt reaches our own
-    // ServerReject(server_full) logic below instead of being silently
-    // refused by ENet itself before we ever see it.
-    if (!server.start(config.port, /*maxClients=*/4, error)) {
+    // A small margin above the real, application-level maxClients so an
+    // over-capacity connection attempt still reaches our own
+    // ServerReject(server_full) logic below, rather than being silently
+    // refused by ENet itself before any message exchange can occur
+    // (increment 3 finding, unchanged reasoning).
+    if (!server.start(config.port,
+                       static_cast<size_t>(config.maxClients) + 4, error)) {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         enet_deinitialize();
         return 2;
     }
 
-    ENetPeer* clientPeer = nullptr;
-    uint8_t clientPlayerId = 0;
-    // Ordered command buffer fed by redundant ControlInput packets (spec,
-    // "Wire protocol changes" / review finding B2): pendingCommands holds
-    // received-but-not-yet-applied commands, keyed by client_seq;
-    // nextExpectedSeq is the next one the server needs; highestSeqSeen is
-    // the highest newest_client_seq any packet has ever reported, used to
-    // detect a seq that can never arrive anymore (the client's own
-    // redundancy window has moved past it in every packet that could
-    // still carry it).
-    std::map<uint32_t, net::ControlCommand> pendingCommands;
-    uint32_t nextExpectedSeq = 1;
-    uint32_t highestSeqSeen = 0;
-    net::ControlCommand lastAppliedCommand{};
-    bool hasInput = false;
+    // The active roster: owned and mutated only by the main thread, only
+    // between ticks (see SpinBarrier's comment). A plain std::vector
+    // rebuilt as clients join/leave rather than in-place reusable slots -
+    // cheap enough at any realistic client count that a slot-reuse scheme
+    // is not worth the added complexity (docs/increment-5-specification.md,
+    // "Server-side concurrency").
+    std::vector<std::unique_ptr<Aircraft>> aircraft;
+
+    // player_id allocation pool (networked mode only): index 0 unused
+    // (0 is reserved as "no client" elsewhere in the wire protocol),
+    // [1, maxClients] is the real pool. Stress aircraft use a separate
+    // range starting at 200 (review finding M2), so they never interact
+    // with this pool or the capacity check below.
+    std::vector<bool> playerIdInUse(static_cast<size_t>(config.maxClients) + 1,
+                                     false);
+    std::vector<PendingOnboard> pendingOnboards;
+
+    if (scripted) {
+        auto a = std::make_unique<Aircraft>();
+        a->kind = AircraftKind::kScripted;
+        a->playerId = 1;
+        a->session = std::move(originSession);
+        aircraft.push_back(std::move(a));
+    } else {
+        originSession.reset();  // origin established; not a live aircraft
+        uint8_t nextStressId = 200;
+        for (int i = 0; i < config.stressAircraft; ++i) {
+            auto a = std::make_unique<Aircraft>();
+            a->kind = AircraftKind::kStress;
+            a->playerId = nextStressId++;
+            a->session = onboardNewAircraft(a->playerId, originLat, originLon);
+            if (!a->session) {
+                std::fprintf(stderr, "error: stress aircraft init/trim failed\n");
+                enet_deinitialize();
+                return 2;
+            }
+            aircraft.push_back(std::move(a));
+        }
+    }
 
     auto onEvent = [&](const ENetEvent& event) {
+        if (scripted) return;  // scripted mode accepts no clients at all
+
         if (event.type == ENET_EVENT_TYPE_DISCONNECT) {
-            if (event.peer == clientPeer) {
-                clientPeer = nullptr;
-                clientPlayerId = 0;
-                hasInput = false;
-                pendingCommands.clear();
-                nextExpectedSeq = 1;
-                highestSeqSeen = 0;
-                lastAppliedCommand = net::ControlCommand{};
+            for (size_t i = 0; i < aircraft.size(); ++i) {
+                if (aircraft[i]->kind == AircraftKind::kClient &&
+                    aircraft[i]->peer == event.peer) {
+                    uint8_t pid = aircraft[i]->playerId;
+                    playerIdInUse[pid] = false;
+                    net::PlayerLeft left{pid};
+                    server.broadcast(net::kChannelReliable,
+                                      net::serializePlayerLeft(left), true);
+                    aircraft.erase(aircraft.begin() + i);
+                    break;
+                }
+            }
+            for (auto& p : pendingOnboards) {
+                if (p.peer == event.peer) p.cancelled = true;
             }
             return;
         }
@@ -208,17 +392,17 @@ int main(int argc, char** argv) {
                     server.send(event.peer, net::kChannelReliable,
                                 net::serializeServerReject(reject), true);
                     server.flush();
-                    // Deliberately does not disconnect the peer here: an
-                    // immediate enet_peer_disconnect() right after
-                    // queuing a reliable send races that packet's actual
-                    // delivery (found by testing - about 40% of runs
-                    // never received the reject at all). The rejected
-                    // client, once it has the message, disconnects
-                    // itself; ENet's own idle timeout reclaims the peer
-                    // if it doesn't.
+                    // Deliberately does not disconnect the peer here (increment
+                    // 3 finding): an immediate enet_peer_disconnect() right
+                    // after queuing a reliable send races that packet's actual
+                    // delivery.
                     return;
                 }
-                if (clientPeer != nullptr) {
+                size_t reservedSlots = pendingOnboards.size();
+                for (auto& a : aircraft) {
+                    if (a->kind == AircraftKind::kClient) ++reservedSlots;
+                }
+                if (reservedSlots >= static_cast<size_t>(config.maxClients)) {
                     net::ServerReject reject{
                         static_cast<uint8_t>(net::RejectReason::kServerFull)};
                     server.send(event.peer, net::kChannelReliable,
@@ -226,164 +410,241 @@ int main(int argc, char** argv) {
                     server.flush();
                     return;
                 }
-                clientPeer = event.peer;
-                clientPlayerId = 1;
-                hasInput = false;
-                pendingCommands.clear();
-                nextExpectedSeq = 1;
-                highestSeqSeen = 0;
-                lastAppliedCommand = net::ControlCommand{};
-                net::ServerWelcome welcome{
-                    net::kProtocolVersion, clientPlayerId,
-                    static_cast<float>(originLat),
-                    static_cast<float>(originLon),
-                    static_cast<uint16_t>(config.snapshotHz)};
-                server.send(event.peer, net::kChannelReliable,
-                            net::serializeServerWelcome(welcome), true);
+                uint8_t pid = 0;
+                for (uint8_t candidate = 1;
+                     candidate <= static_cast<uint8_t>(config.maxClients);
+                     ++candidate) {
+                    if (!playerIdInUse[candidate]) {
+                        pid = candidate;
+                        break;
+                    }
+                }
+                playerIdInUse[pid] = true;
+                PendingOnboard po;
+                po.peer = event.peer;
+                po.playerId = pid;
+                po.future = std::async(std::launch::async, onboardNewAircraft,
+                                        pid, originLat, originLon);
+                pendingOnboards.push_back(std::move(po));
                 break;
             }
             case net::MessageTag::kControlInput: {
-                if (event.peer != clientPeer) return;
                 net::ControlInput input;
                 if (!net::deserializeControlInput(event.packet->data,
                                                    event.packet->dataLength,
                                                    input)) {
                     return;
                 }
-                // Redundant multi-command packet (spec, "Wire protocol
-                // changes" / review finding B2): merge every command not
-                // already decided into the ordered buffer. Commands are
-                // seqs newest_client_seq, newest_client_seq-1, ...
-                // descending; the `i <= newest_client_seq` bound avoids
-                // underflowing seq for a short first packet.
-                for (size_t i = 0;
-                     i < input.commands.size() && i <= input.newest_client_seq;
-                     ++i) {
-                    uint32_t seq =
-                        input.newest_client_seq - static_cast<uint32_t>(i);
-                    if (seq >= nextExpectedSeq) {
-                        pendingCommands[seq] = input.commands[i];
+                for (auto& a : aircraft) {
+                    if (a->kind != AircraftKind::kClient ||
+                        a->peer != event.peer) {
+                        continue;
                     }
+                    CommandBuffer& cb = a->cmdBuf;
+                    // Redundant multi-command packet (increment 4, "Wire
+                    // protocol changes" / review finding B2): merge every
+                    // command not already decided into the ordered buffer.
+                    for (size_t i = 0; i < input.commands.size() &&
+                                       i <= input.newest_client_seq;
+                         ++i) {
+                        uint32_t seq = input.newest_client_seq -
+                                       static_cast<uint32_t>(i);
+                        if (seq >= cb.nextExpectedSeq) {
+                            cb.pending[seq] = input.commands[i];
+                        }
+                    }
+                    cb.highestSeqSeen =
+                        std::max(cb.highestSeqSeen, input.newest_client_seq);
+                    cb.hasInput = true;
+                    break;
                 }
-                highestSeqSeen = std::max(highestSeqSeen, input.newest_client_seq);
-                hasInput = true;
                 break;
             }
             case net::MessageTag::kClientBye:
-                if (event.peer == clientPeer) server.disconnect(event.peer);
+                server.disconnect(event.peer);
                 break;
             default:
                 break;
         }
     };
 
+    // ---- Worker pool (docs/increment-5-specification.md, "Server-side
+    // concurrency" - verified protocol, Appendix B / probe_dynamic_pool.cpp)
+    unsigned hwConcurrency = std::thread::hardware_concurrency();
+    int numWorkers = std::max(1, hwConcurrency > 1
+                                      ? static_cast<int>(hwConcurrency) - 1
+                                      : 1);
+    SpinBarrier tickBarrier(numWorkers + 1);
+    std::atomic<bool> poolStop{false};
+    std::vector<std::thread> workers;
+    workers.reserve(numWorkers);
+
+    auto applyClientCommand = [](Aircraft& a) {
+        CommandBuffer& cb = a.cmdBuf;
+        if (!cb.hasInput) return;  // leave trim values alone (increment 3)
+        auto it = cb.pending.find(cb.nextExpectedSeq);
+        if (it != cb.pending.end()) {
+            cb.lastApplied = it->second;
+            ++cb.nextExpectedSeq;
+        } else if (cb.highestSeqSeen >=
+                   cb.nextExpectedSeq + net::kMaxRedundantCommands) {
+            ++cb.nextExpectedSeq;
+        }
+        cb.pending.erase(cb.pending.begin(),
+                          cb.pending.lower_bound(cb.nextExpectedSeq));
+        a.session->setProperty("fcs/elevator-cmd-norm",
+                                net::decodeAxis(cb.lastApplied.elevator));
+        a.session->setProperty("fcs/aileron-cmd-norm",
+                                net::decodeAxis(cb.lastApplied.aileron));
+        a.session->setProperty("fcs/rudder-cmd-norm",
+                                net::decodeAxis(cb.lastApplied.rudder));
+        a.session->setProperty("fcs/throttle-cmd-norm",
+                                net::decodeThrottle(cb.lastApplied.throttle));
+    };
+
+    for (int w = 0; w < numWorkers; ++w) {
+        workers.emplace_back([&, w]() {
+            while (true) {
+                tickBarrier.arriveAndWait();  // wait for main's "go"
+                if (poolStop.load(std::memory_order_relaxed)) return;
+                int n = static_cast<int>(aircraft.size());
+                int chunk = (n + numWorkers - 1) / numWorkers;
+                int lo = std::min(n, w * chunk);
+                int hi = std::min(n, lo + chunk);
+                for (int i = lo; i < hi; ++i) {
+                    Aircraft& a = *aircraft[i];
+                    if (a.kind == AircraftKind::kClient) {
+                        applyClientCommand(a);
+                    } else if (a.kind == AircraftKind::kScripted) {
+                        // Reproduces src/scenarios/pitch_response.cpp's
+                        // exact schedule so the server-side trajectory
+                        // matches increment 1's validated one.
+                        double t = a.session->property("simulation/sim-time-sec");
+                        if (t >= 5.0) {
+                            a.session->setProperty("fcs/elevator-cmd-norm", -1.0);
+                        }
+                    }
+                    // kStress: no input change - frozen at whatever trim
+                    // left the controls (unpiloted, per the spec).
+                    a.session->step();
+                }
+                tickBarrier.arriveAndWait();  // signal done
+            }
+        });
+    }
+
     std::vector<inc1::FlightSample> samples;
     const long scriptedTicks =
-        scripted ? std::lround(30.0 / inc1::kDt) : -1;  // pitch_response duration
-    if (scripted) {
-        samples.reserve(static_cast<size_t>(scriptedTicks) + 1);
-        samples.push_back(session.sample());
-    }
+        scripted ? std::lround(30.0 / inc1::kDt) : -1;
+    if (scripted) samples.push_back(aircraft[0]->session->sample());
 
     const int snapshotInterval =
         std::max(1, static_cast<int>(std::lround(120.0 / config.snapshotHz)));
     uint32_t tick = 0;
 
     auto stepOneTick = [&]() {
-        double t = session.property("simulation/sim-time-sec");
-        if (scripted) {
-            // Reproduces src/scenarios/pitch_response.cpp's exact
-            // schedule so the server-side trajectory matches increment
-            // 1's validated one.
-            if (t >= 5.0) session.setProperty("fcs/elevator-cmd-norm", -1.0);
-        } else if (hasInput) {
-            // Apply exactly one command per tick, in ascending client_seq
-            // order, holding the last applied command across a gap (spec,
-            // "Wire protocol changes"). A seq becomes provably
-            // unrecoverable once the client has moved
-            // kMaxRedundantCommands past it in every packet that could
-            // still have carried it - skip forward past it (still holding
-            // the last command for its tick) rather than stalling.
-            auto pendingIt = pendingCommands.find(nextExpectedSeq);
-            if (pendingIt != pendingCommands.end()) {
-                lastAppliedCommand = pendingIt->second;
-                ++nextExpectedSeq;
-            } else if (highestSeqSeen >=
-                       nextExpectedSeq + net::kMaxRedundantCommands) {
-                ++nextExpectedSeq;
+        // Main's between-tick work: drain any completed onboarding
+        // (splicing the new aircraft into the roster and welcoming its
+        // peer), then release the workers for this tick. All of this
+        // happens strictly before tickBarrier.arriveAndWait() below, so
+        // it is safely visible to workers once they return from theirs
+        // (docs/increment-5-specification.md, "Server-side concurrency").
+        for (size_t i = 0; i < pendingOnboards.size();) {
+            PendingOnboard& po = pendingOnboards[i];
+            if (po.future.wait_for(std::chrono::seconds(0)) ==
+                std::future_status::ready) {
+                std::unique_ptr<inc1::FlightSession> session = po.future.get();
+                if (!po.cancelled && session) {
+                    auto a = std::make_unique<Aircraft>();
+                    a->kind = AircraftKind::kClient;
+                    a->playerId = po.playerId;
+                    a->session = std::move(session);
+                    a->peer = po.peer;
+                    aircraft.push_back(std::move(a));
+                    net::ServerWelcome welcome{
+                        net::kProtocolVersion, po.playerId,
+                        static_cast<float>(originLat),
+                        static_cast<float>(originLon),
+                        static_cast<uint16_t>(config.snapshotHz)};
+                    server.send(po.peer, net::kChannelReliable,
+                                net::serializeServerWelcome(welcome), true);
+                } else {
+                    playerIdInUse[po.playerId] = false;
+                }
+                pendingOnboards.erase(pendingOnboards.begin() + i);
+            } else {
+                ++i;
             }
-            pendingCommands.erase(pendingCommands.begin(),
-                                   pendingCommands.lower_bound(nextExpectedSeq));
-
-            session.setProperty("fcs/elevator-cmd-norm",
-                                 net::decodeAxis(lastAppliedCommand.elevator));
-            session.setProperty("fcs/aileron-cmd-norm",
-                                 net::decodeAxis(lastAppliedCommand.aileron));
-            session.setProperty("fcs/rudder-cmd-norm",
-                                 net::decodeAxis(lastAppliedCommand.rudder));
-            session.setProperty(
-                "fcs/throttle-cmd-norm",
-                net::decodeThrottle(lastAppliedCommand.throttle));
         }
-        session.step();
+
+        tickBarrier.arriveAndWait();  // release workers for this tick
+        tickBarrier.arriveAndWait();  // wait for them to finish
+
         ++tick;
-        inc1::FlightSample sample = session.sample();
-        if (scripted) samples.push_back(sample);
+        if (scripted) samples.push_back(aircraft[0]->session->sample());
 
-        if (tick % static_cast<uint32_t>(snapshotInterval) == 0) {
-            net::StateSnapshot snap;
-            snap.server_tick = tick;
-            // nextExpectedSeq starts at 1 whether or not any input has
-            // arrived yet, so this is 0 (meaning "nothing applied yet")
-            // in both scripted mode and before a networked client's first
-            // packet, with no special-casing needed.
-            snap.ack_client_seq = nextExpectedSeq - 1;
-            net::AircraftState a;
-            a.player_id = 1;
-            geo::LocalOffset off = geo::computeLocalOffset(
-                sample.lat_deg, sample.lon_deg, originLat, originLon);
-            a.pos_local_m[0] = static_cast<float>(off.east_m);
-            a.pos_local_m[1] = static_cast<float>(sample.alt_m);
-            a.pos_local_m[2] = static_cast<float>(-off.north_m);
-            // Increment 4 (docs/increment-4-specification.md Appendix A):
-            // the wire quat is JSBSim's own native qAttitudeLocal
-            // (body->NED), read directly - not re-derived from Euler
-            // angles via geo::computeOrientationQuat() - so reconciliation
-            // can reconstruct a VehicleState without a lossy Euler
-            // round-trip.
-            JSBSim::FGQuaternion qLocal = session.getVState().qAttitudeLocal;
-            a.quat[0] = static_cast<float>(qLocal(1));
-            a.quat[1] = static_cast<float>(qLocal(2));
-            a.quat[2] = static_cast<float>(qLocal(3));
-            a.quat[3] = static_cast<float>(qLocal(4));
-            // Local frame is East/Up/-North, matching position (Up = -Down).
-            a.vel_local_mps[0] = static_cast<float>(sample.vel_east_mps);
-            a.vel_local_mps[1] = static_cast<float>(-sample.vel_down_mps);
-            a.vel_local_mps[2] = static_cast<float>(-sample.vel_north_mps);
-            a.ang_vel_body_rps[0] =
-                static_cast<float>(session.property("velocities/p-rad_sec"));
-            a.ang_vel_body_rps[1] =
-                static_cast<float>(session.property("velocities/q-rad_sec"));
-            a.ang_vel_body_rps[2] =
-                static_cast<float>(session.property("velocities/r-rad_sec"));
-            a.status_flags = 0;
-            snap.aircraft.push_back(a);
+        if (tick % static_cast<uint32_t>(snapshotInterval) == 0 &&
+            !aircraft.empty()) {
+            std::vector<net::AircraftState> allStates;
+            allStates.reserve(aircraft.size());
+            for (auto& a : aircraft) {
+                inc1::FlightSample sample = a->session->sample();
+                net::AircraftState as;
+                as.player_id = a->playerId;
+                geo::LocalOffset off = geo::computeLocalOffset(
+                    sample.lat_deg, sample.lon_deg, originLat, originLon);
+                as.pos_local_m[0] = static_cast<float>(off.east_m);
+                as.pos_local_m[1] = static_cast<float>(sample.alt_m);
+                as.pos_local_m[2] = static_cast<float>(-off.north_m);
+                JSBSim::FGQuaternion qLocal =
+                    a->session->getVState().qAttitudeLocal;
+                as.quat[0] = static_cast<float>(qLocal(1));
+                as.quat[1] = static_cast<float>(qLocal(2));
+                as.quat[2] = static_cast<float>(qLocal(3));
+                as.quat[3] = static_cast<float>(qLocal(4));
+                as.vel_local_mps[0] = static_cast<float>(sample.vel_east_mps);
+                as.vel_local_mps[1] = static_cast<float>(-sample.vel_down_mps);
+                as.vel_local_mps[2] = static_cast<float>(-sample.vel_north_mps);
+                as.ang_vel_body_rps[0] = static_cast<float>(
+                    a->session->property("velocities/p-rad_sec"));
+                as.ang_vel_body_rps[1] = static_cast<float>(
+                    a->session->property("velocities/q-rad_sec"));
+                as.ang_vel_body_rps[2] = static_cast<float>(
+                    a->session->property("velocities/r-rad_sec"));
+                as.status_flags = 0;
+                // Increment 5 (review finding, "Wire protocol changes"
+                // point 3): ack_client_seq is now per-aircraft, meaningful
+                // only to this aircraft's own owning client; 0 for
+                // scripted/stress aircraft, which own no connection.
+                as.ack_client_seq = (a->kind == AircraftKind::kClient)
+                                        ? (a->cmdBuf.nextExpectedSeq - 1)
+                                        : 0;
+                allStates.push_back(as);
+            }
 
-            net::writeSnapshotCsvRow(snapLog, snap);
+            size_t chunkCount =
+                (allStates.size() + net::kMaxAircraftPerChunk - 1) /
+                net::kMaxAircraftPerChunk;
+            for (size_t c = 0; c < chunkCount; ++c) {
+                net::StateSnapshot snap;
+                snap.server_tick = tick;
+                snap.chunk_index = static_cast<uint8_t>(c);
+                snap.chunk_count = static_cast<uint8_t>(chunkCount);
+                size_t lo = c * net::kMaxAircraftPerChunk;
+                size_t hi = std::min(allStates.size(),
+                                      lo + net::kMaxAircraftPerChunk);
+                snap.aircraft.assign(allStates.begin() + lo,
+                                      allStates.begin() + hi);
+                net::writeSnapshotCsvRow(snapLog, snap);
+                server.broadcast(net::kChannelUnreliable,
+                                  net::serializeStateSnapshot(snap), false);
+            }
             snapLog.flush();  // a concurrently-running test client reads this file live
-            server.broadcast(net::kChannelUnreliable,
-                              net::serializeStateSnapshot(snap), false);
             server.flush();
         }
     };
 
-    // Wall-clock-paced fixed-timestep loop (spec, "Server (flight_server)"
-    // item 3): enet_host_service's own timeout doubles as the sleep, so
-    // waiting for the next tick and servicing the network are one call.
     auto nextTick = std::chrono::steady_clock::now();
-    // Matches increment 2's own measured Godot catch-up behaviour (8
-    // ticks after a 100 ms slow frame, increment-2 spec Appendix B) -
-    // reusing that empirically-grounded cap rather than an arbitrary one.
     constexpr int kMaxCatchUpTicks = 8;
 
     bool finished = false;
@@ -415,6 +676,10 @@ int main(int argc, char** argv) {
         }
         server.poll(0, onEvent);
     }
+
+    poolStop.store(true, std::memory_order_relaxed);
+    tickBarrier.arriveAndWait();  // release workers so they observe the stop
+    for (auto& w : workers) w.join();
 
     int exitCode = 0;
     if (scripted) {

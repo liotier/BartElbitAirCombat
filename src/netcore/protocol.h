@@ -62,6 +62,15 @@ constexpr double kThrottleScale = 255.0;
 // 40% loss - verified, docs/increment-4-specification.md Appendix B).
 constexpr uint8_t kMaxRedundantCommands = 6;
 
+// Increment 5, "Wire protocol changes": max aircraft carried by one
+// StateSnapshot chunk. Chosen with real margin below the measured/computed
+// 23-aircraft fragmentation threshold at today's 58-byte AircraftState
+// (docs/increment-5-specification.md Appendix B) so it survives future
+// per-aircraft field growth without needing to be re-derived under time
+// pressure - see the spec's "Why application-level chunking" section for
+// why chunking, not ENet's own fragmentation, is the fix.
+constexpr uint8_t kMaxAircraftPerChunk = 16;
+
 enum class MessageTag : uint8_t {
     kClientHello = 1,
     kServerWelcome = 2,
@@ -69,6 +78,7 @@ enum class MessageTag : uint8_t {
     kControlInput = 4,
     kStateSnapshot = 5,
     kClientBye = 6,
+    kPlayerLeft = 7,
 };
 
 enum class RejectReason : uint8_t {
@@ -130,15 +140,38 @@ struct AircraftState {
     // fed straight to VehicleState::vPQR with no rotation.
     float ang_vel_body_rps[3] = {0.0f, 0.0f, 0.0f};
     uint8_t status_flags = 0;
+    // Increment 5 (docs/increment-5-specification.md, "Wire protocol
+    // changes" point 3): relocated from StateSnapshot's top level. Highest
+    // client_seq the server has applied for THIS aircraft's owning
+    // connection - meaningful only on the entry matching the reading
+    // client's own assigned_player_id; every other entry's value is
+    // ignored by everyone but that aircraft's owning client. A single
+    // top-level scalar could carry only one client's ack per broadcast
+    // packet, which stopped being sufficient once a broadcast serves more
+    // than one client.
+    uint32_t ack_client_seq = 0;
 };
 
 struct StateSnapshot {
     uint32_t server_tick = 0;
-    // Increment 4: highest client_seq the server has applied as of this
-    // tick - connection-scoped (meaningful only to the client that owns
-    // this connection), not a per-aircraft property.
-    uint32_t ack_client_seq = 0;
+    // Increment 5: a tick's full aircraft list may be split across
+    // multiple StateSnapshot packets (see kMaxAircraftPerChunk) - every
+    // chunk of one tick shares the same server_tick and chunk_count;
+    // chunk_index is this packet's 0-based position among them. A client
+    // processes each chunk independently as it arrives (spec, "Wire
+    // protocol changes" point 2) - these fields are framing, not a
+    // reassembly requirement.
+    uint8_t chunk_index = 0;
+    uint8_t chunk_count = 1;
     std::vector<AircraftState> aircraft;
+};
+
+// Increment 5: broadcast reliably when the server detects a client
+// disconnect, so remote-entity tracking (interpcore::RemoteEntityTracker)
+// can remove that player_id deterministically rather than guessing from a
+// gap in snapshots.
+struct PlayerLeft {
+    uint8_t player_id = 0;
 };
 
 using ByteBuffer = std::vector<uint8_t>;
@@ -159,6 +192,7 @@ ByteBuffer serializeServerReject(const ServerReject& msg);
 ByteBuffer serializeControlInput(const ControlInput& msg);
 ByteBuffer serializeStateSnapshot(const StateSnapshot& msg);
 ByteBuffer serializeClientBye();
+ByteBuffer serializePlayerLeft(const PlayerLeft& msg);
 
 // Each deserialize function verifies the leading tag byte and that the
 // buffer is at least as long as the fixed-size fields require, then
@@ -175,6 +209,7 @@ bool deserializeControlInput(const uint8_t* data, size_t len,
 bool deserializeStateSnapshot(const uint8_t* data, size_t len,
                                StateSnapshot& out);
 bool deserializeClientBye(const uint8_t* data, size_t len);
+bool deserializePlayerLeft(const uint8_t* data, size_t len, PlayerLeft& out);
 
 // Reads just the leading tag byte, for dispatch before picking which
 // deserialize function to call. False if `len` is 0.

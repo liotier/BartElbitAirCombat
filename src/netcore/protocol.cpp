@@ -211,7 +211,8 @@ ByteBuffer serializeStateSnapshot(const StateSnapshot& msg) {
     ByteWriter w;
     w.putU8(static_cast<uint8_t>(MessageTag::kStateSnapshot));
     w.putU32(msg.server_tick);
-    w.putU32(msg.ack_client_seq);
+    w.putU8(msg.chunk_index);
+    w.putU8(msg.chunk_count);
     w.putU8(static_cast<uint8_t>(msg.aircraft.size()));
     for (const AircraftState& a : msg.aircraft) {
         w.putU8(a.player_id);
@@ -220,6 +221,7 @@ ByteBuffer serializeStateSnapshot(const StateSnapshot& msg) {
         for (float v : a.vel_local_mps) w.putF32(v);
         for (float v : a.ang_vel_body_rps) w.putF32(v);
         w.putU8(a.status_flags);
+        w.putU32(a.ack_client_seq);
     }
     return w.take();
 }
@@ -229,8 +231,8 @@ bool deserializeStateSnapshot(const uint8_t* data, size_t len,
     ByteReader r(data, len);
     if (!checkTag(r, MessageTag::kStateSnapshot)) return false;
     uint8_t count;
-    if (!r.getU32(out.server_tick) || !r.getU32(out.ack_client_seq) ||
-        !r.getU8(count)) {
+    if (!r.getU32(out.server_tick) || !r.getU8(out.chunk_index) ||
+        !r.getU8(out.chunk_count) || !r.getU8(count)) {
         return false;
     }
     out.aircraft.clear();
@@ -250,7 +252,9 @@ bool deserializeStateSnapshot(const uint8_t* data, size_t len,
         for (float& v : a.ang_vel_body_rps) {
             if (!r.getF32(v)) return false;
         }
-        if (!r.getU8(a.status_flags)) return false;
+        if (!r.getU8(a.status_flags) || !r.getU32(a.ack_client_seq)) {
+            return false;
+        }
         out.aircraft.push_back(a);
     }
     return true;
@@ -265,6 +269,19 @@ ByteBuffer serializeClientBye() {
 bool deserializeClientBye(const uint8_t* data, size_t len) {
     ByteReader r(data, len);
     return checkTag(r, MessageTag::kClientBye);
+}
+
+ByteBuffer serializePlayerLeft(const PlayerLeft& msg) {
+    ByteWriter w;
+    w.putU8(static_cast<uint8_t>(MessageTag::kPlayerLeft));
+    w.putU8(msg.player_id);
+    return w.take();
+}
+
+bool deserializePlayerLeft(const uint8_t* data, size_t len, PlayerLeft& out) {
+    ByteReader r(data, len);
+    if (!checkTag(r, MessageTag::kPlayerLeft)) return false;
+    return r.getU8(out.player_id);
 }
 
 bool peekMessageTag(const uint8_t* data, size_t len, MessageTag& tagOut) {

@@ -15,44 +15,48 @@
 
 #include "remote_aircraft.h"
 
-#include "network_client.h"
+#include "predicted_aircraft.h"
 
 #include <godot_cpp/core/class_db.hpp>
-#include <godot_cpp/variant/basis.hpp>
 #include <godot_cpp/variant/transform3d.hpp>
-#include <godot_cpp/variant/utility_functions.hpp>
 
 namespace godot {
 
-void RemoteAircraft::_bind_methods() {}
+void RemoteAircraft::_bind_methods() {
+    ClassDB::bind_method(D_METHOD("set_player_id", "id"),
+                         &RemoteAircraft::setPlayerId);
+    ClassDB::bind_method(D_METHOD("get_player_id"),
+                         &RemoteAircraft::getPlayerId);
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "player_id"), "set_player_id",
+                 "get_player_id");
 
-void RemoteAircraft::_ready() {
-    // Sibling lookup, matching flight_input.gd's own hardcoded
-    // get_node("../FlightAircraft") convention (increment 2) rather than
-    // an exported NodePath property this project has no other precedent
-    // for.
-    Node* n = get_node_or_null(NodePath("../NetworkClient"));
-    networkClient_ = Object::cast_to<NetworkClient>(n);
-    if (!networkClient_) {
-        UtilityFunctions::printerr(
-            "RemoteAircraft: sibling NetworkClient not found at "
-            "../NetworkClient");
-    }
+    ClassDB::bind_method(D_METHOD("set_source", "source"),
+                         &RemoteAircraft::setSource);
+    ClassDB::bind_method(D_METHOD("get_source"), &RemoteAircraft::getSource);
+    ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "source", PROPERTY_HINT_NODE_TYPE,
+                              "PredictedAircraft"),
+                 "set_source", "get_source");
 }
 
 void RemoteAircraft::_physics_process(double delta) {
     (void)delta;
-    if (!networkClient_ || !networkClient_->hasSnapshot()) return;
-    // Wire fields are already in Godot's local East/Up/-North frame and
-    // already a rotation quaternion in Godot's own convention (both
-    // computed server-side by geo::computeLocalOffset()/
-    // computeOrientationQuat() - see docs/increment-3-specification.md's
-    // implementation notes), so this is direct application, not a call
-    // through computeAircraftTransform() (which converts from geodetic
-    // lat/lon and Euler angles - a different, upstream representation).
+    PredictedAircraft* source = Object::cast_to<PredictedAircraft>(source_);
+    if (!source || !source->hasRemote(playerId_)) return;
+    // Both already in Godot's local East/Up/-North frame and Godot's own
+    // rotation convention (PredictedAircraft::getRemotePosition()/
+    // getRemoteOrientation() do the native-to-Godot conversion) - direct
+    // application, no blending: unlike PredictedAircraft's own aircraft,
+    // there is no "correction" event to smooth over here, only a
+    // continuously-updated interpolated/extrapolated pose (docs/
+    // increment-5-specification.md, "Godot integration").
     set_global_transform(
-        Transform3D(Basis(networkClient_->getRemoteOrientation()),
-                    networkClient_->getRemotePosition()));
+        Transform3D(Basis(source->getRemoteOrientation(playerId_)),
+                    source->getRemotePosition(playerId_)));
 }
+
+void RemoteAircraft::setPlayerId(int id) { playerId_ = id; }
+int RemoteAircraft::getPlayerId() const { return playerId_; }
+void RemoteAircraft::setSource(Node* source) { source_ = source; }
+Node* RemoteAircraft::getSource() const { return source_; }
 
 }  // namespace godot

@@ -24,11 +24,16 @@
 # (docs/increment-4-specification.md, "Test plan"): the reconstruction-gate
 # regression test, prediction correctness on a clean link, reconciliation
 # correctness with its required negative control, aggressive-analog
-# resilience under loss, and a repeat under injected latency. All
-# pass/fail evaluation happens inside the test binaries or the headless
-# test driver script; this script only configures, builds, fetches Godot,
-# invokes everything, starts/stops the server and relay processes it
-# needs, and relays exit status.
+# resilience under loss, and a repeat under injected latency - then the
+# increment-5 multi-core/multi-client phase (docs/increment-5-
+# specification.md, "Test plan"): interpcore's own unit tests, the MTU
+# fragmentation-threshold regression guard, multi-client correctness
+# (distinct player IDs, no cross-talk, live remote-entity tracking,
+# capacity/slot-reuse), and chunked-StateSnapshot correctness at the
+# chunk-boundary aircraft counts. All pass/fail evaluation happens inside
+# the test binaries or the headless test driver script; this script only
+# configures, builds, fetches Godot, invokes everything, starts/stops the
+# server and relay processes it needs, and relays exit status.
 #
 # Exit codes: 0 all tests passed, 1 a test failed, 2 a required tool is
 # missing, 3 cmake configure failed, 4 the build failed, 5 the increment 1
@@ -129,6 +134,7 @@ FLIGHT_SERVER="$BUILD_DIR/flight_server"
 FLIGHT_TEST_CLIENT="$BUILD_DIR/flight_test_client"
 NET_RELAY="$BUILD_DIR/net_relay"
 PREDICTCORE_TESTS="$BUILD_DIR/predictcore_tests"
+INTERPCORE_TESTS="$BUILD_DIR/interpcore_tests"
 NET_PORT=45300
 RELAY_PORT=45301
 
@@ -366,8 +372,88 @@ for status in "$GATE_STATUS" "$PREDICT_STEP_STATUS" "$PREDICT_FORCED_ON_STATUS" 
   fi
 done
 
+echo "== Running increment 5 concurrency/scaling tests =="
+trap cleanup_net_procs EXIT
+
+# Step: interpcore unit tests (docs/increment-5-specification.md, "Test
+# plan" items 1-4) - synthetic data, no server/client needed.
+echo "-- interpcore unit tests --"
+set +e
+"$INTERPCORE_TESTS"
+INTERPCORE_STATUS=$?
+set -e
+
+# Step: the MTU fragmentation-threshold regression test (test-plan item 9)
+# - pure serialization-size check, no server/client needed. Guards against
+# a future AircraftState field silently pushing a full chunk over the
+# unreliable-send threshold (Appendix B's MTU finding).
+echo "-- MTU regression (kMaxAircraftPerChunk stays under the fragmentation threshold) --"
+set +e
+"$FLIGHT_TEST_CLIENT" --mode mtu_regression
+MTU_STATUS=$?
+set -e
+
+# Step: multi-client correctness - distinct player-ID assignment, no
+# cross-talk between clients' own aircraft, live interpcore-based tracking
+# of other clients' aircraft (test-plan items 5, 8), plus capacity
+# (kServerFull) and slot reuse after a disconnect (test 6) - a small
+# --max-clients so the 4th connection attempt in this same run is a real
+# over-capacity case.
+echo "-- multiclient: distinct IDs, no cross-talk, live tracking, capacity/slot-reuse --"
+"$FLIGHT_SERVER" --port "$NET_PORT" --snapshot-hz 30 --max-clients 3 \
+  --log-name networked_multiclient &
+CURRENT_SERVER_PID=$!
+sleep 1
+
+set +e
+"$FLIGHT_TEST_CLIENT" --mode multiclient --host 127.0.0.1 --port "$NET_PORT" \
+  --num-clients 3 --test-capacity
+MULTICLIENT_STATUS=$?
+set -e
+
+cleanup_net_procs
+
+# Step: chunking correctness at scale (test-plan item 7) - a server
+# started with --stress-aircraft (synthetic, unpiloted aircraft counted
+# separately from real clients, review finding M2) alongside 2 real
+# clients, checked at the chunk-boundary values a ceil(N/16) computation
+# is most likely to get wrong (review finding m1): exactly one full chunk
+# (16), one chunk plus a straggler (17), and exactly two full chunks (32),
+# plus a count comfortably past the boundary (30).
+NET5_CHUNK_STATUS=0
+for total in 16 17 30 32; do
+  stress=$((total - 2))
+  echo "-- chunking: $total total aircraft (2 real + $stress stress) --"
+  "$FLIGHT_SERVER" --port "$NET_PORT" --snapshot-hz 30 --max-clients 8 \
+    --stress-aircraft "$stress" --log-name "networked_chunk_${total}" &
+  CURRENT_SERVER_PID=$!
+  sleep 1.5
+
+  set +e
+  "$FLIGHT_TEST_CLIENT" --mode multiclient --host 127.0.0.1 --port "$NET_PORT" \
+    --num-clients 2 --expect-total-aircraft "$total"
+  chunk_status=$?
+  set -e
+  if [ "$chunk_status" -ne 0 ]; then
+    NET5_CHUNK_STATUS=1
+  fi
+
+  cleanup_net_procs
+done
+
+trap - EXIT
+
+NET5_OVERALL_STATUS=0
+for status in "$INTERPCORE_STATUS" "$MTU_STATUS" "$MULTICLIENT_STATUS" \
+              "$NET5_CHUNK_STATUS"; do
+  if [ "$status" -ne 0 ]; then
+    NET5_OVERALL_STATUS=1
+  fi
+done
+
 if [ "$BINARY_STATUS" -ne 0 ] || [ "$GODOT_OVERALL_STATUS" -ne 0 ] || \
-   [ "$NET3_OVERALL_STATUS" -ne 0 ] || [ "$NET4_OVERALL_STATUS" -ne 0 ]; then
+   [ "$NET3_OVERALL_STATUS" -ne 0 ] || [ "$NET4_OVERALL_STATUS" -ne 0 ] || \
+   [ "$NET5_OVERALL_STATUS" -ne 0 ]; then
   exit 1
 fi
 exit 0

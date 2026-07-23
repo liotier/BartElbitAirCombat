@@ -13,22 +13,25 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// GDExtension Node3D that applies a NetworkClient's latest received
-// snapshot to its own transform - raw application, no interpolation
-// (docs/increment-3-specification.md, "Godot client"; smoothing is
-// increment 4). Deliberately does not share a base class with
-// FlightAircraft (increment 2): one steps a FlightSession every tick,
-// this one only ever consumes already-resolved position/orientation, so
-// the only thing in common is being a Node3D, which Node3D itself
-// already provides (implementation note, resolving the spec's own
-// "share a base class?" open question).
+// GDExtension Node3D representing ONE other connected player's aircraft
+// (docs/increment-5-specification.md, "Godot integration"). Increment 5
+// rework: previously a single scene-authored node consuming one
+// NetworkClient singleton's one latestAircraft_ (raw snapshot application,
+// no interpolation); now dynamically instanced - one per other player_id,
+// spawned/freed by a GDScript sibling script watching
+// PredictedAircraft::get_active_remote_player_ids() (entity orchestration
+// is GDScript's job per this project's two-layer language split,
+// docs/roadmap.md's "Standing design decisions" - this class itself does
+// not decide when to exist). `source` is set once by the spawner right
+// after instancing, before add_child() - a direct reference rather than a
+// NodePath lookup, since a dynamically-instanced node has no fixed
+// position in the scene tree to look one up from.
 #pragma once
 
+#include <godot_cpp/classes/node.hpp>
 #include <godot_cpp/classes/node3d.hpp>
 
 namespace godot {
-
-class NetworkClient;
 
 class RemoteAircraft : public Node3D {
     GDCLASS(RemoteAircraft, Node3D)
@@ -37,11 +40,16 @@ protected:
     static void _bind_methods();
 
 public:
-    void _ready() override;
     void _physics_process(double delta) override;
 
+    void setPlayerId(int id);
+    int getPlayerId() const;
+    void setSource(Node* source);
+    Node* getSource() const;
+
 private:
-    NetworkClient* networkClient_ = nullptr;
+    int playerId_ = 0;
+    Node* source_ = nullptr;
 };
 
 }  // namespace godot

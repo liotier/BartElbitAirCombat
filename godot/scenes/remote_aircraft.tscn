@@ -1,0 +1,27 @@
+[gd_scene load_steps=5 format=3]
+
+[sub_resource type="BoxMesh" id="mesh_body"]
+size = Vector3(1.5, 1, 6)
+
+[sub_resource type="StandardMaterial3D" id="mat_body"]
+albedo_color = Color(0.55, 0.65, 0.85, 1)
+
+[sub_resource type="CylinderMesh" id="mesh_nose"]
+top_radius = 0.0
+bottom_radius = 0.5
+height = 1.0
+
+[sub_resource type="StandardMaterial3D" id="mat_nose"]
+albedo_color = Color(0.2, 0.7, 0.3, 1)
+
+[node name="RemoteAircraft" type="RemoteAircraft"]
+
+[node name="PlaceholderMesh" type="MeshInstance3D" parent="."]
+mesh = SubResource("mesh_body")
+surface_material_override/0 = SubResource("mat_body")
+
+[node name="NoseMarker" type="MeshInstance3D" parent="."]
+position = Vector3(0, 0, -3.5)
+rotation_degrees = Vector3(-90, 0, 0)
+mesh = SubResource("mesh_nose")
+surface_material_override/0 = SubResource("mat_nose")

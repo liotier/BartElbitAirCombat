@@ -47,6 +47,13 @@ jobs:
       # ~1.5s server/relay startup) - well under a minute of added time,
       # confirmed to remain inside the existing 20-minute budget rather
       # than requiring it to be raised.
+      #
+      # increment 5 spec, "Acceptance criteria" #8: adds interpcore_tests
+      # and the MTU regression check (both near-instant, synthetic data
+      # only) plus 5 more short networked invocations (the multiclient
+      # test, ~4s, and four chunking-boundary counts, ~4s each plus
+      # ~1.5s server startup for --stress-aircraft) - on the order of 30s
+      # added, confirmed to remain inside the existing 20-minute budget.
       - name: Run full test suite
         run: ./scripts/run_tests.sh
 
