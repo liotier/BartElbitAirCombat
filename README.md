@@ -67,7 +67,31 @@ Each client also renders every *other* player's aircraft, via `interpcore`'s `Re
 - **The Godot client** (`PredictedAircraft` GDExtension node, subclassing `FlightAircraft`; `godot/scenes/networked.tscn`) is the human-facing client: it owns both the local predicting `FlightSession` and the network connection, sends keyboard input directly to its own inherited control-surface properties, blends the rendered transform across any reconciliation correction rather than snapping it, and owns the single `RemoteEntityTracker` for every other connected player. A GDScript sibling (`remote_aircraft_spawner.gd`) polls which other player IDs are currently active and dynamically instances/frees one `RemoteAircraft` node per one — entity spawn/despawn is GDScript's job, not the GDExtension layer's, per this project's own two-layer language split.
 - **`net_relay`** (`src/net_test/`) is a userspace UDP relay used only for testing: it forwards real datagrams between a client and the server while injecting a configurable one-way delay and drop probability, so resilience tests exercise ENet's actual behaviour under an impaired link rather than an application-level approximation of one.
 
+### Quick start for testers
+
+`scripts/build_server.sh`, `scripts/build_client.sh`, `scripts/server.sh`, and `scripts/start_client.sh` wrap the manual steps below into one command each, for testers who just want to host or fly rather than run CMake by hand. A dedicated server host only needs the first pair; a player only needs the second pair — building one side never requires building the other's dependencies.
+
+```bash
+# on the machine hosting the game:
+./scripts/build_server.sh                   # configures + builds only flight_server (skips godot-cpp entirely)
+./scripts/server.sh start --max-clients 8   # starts it in the background; logs to run/server.log
+./scripts/server.sh status                  # is it running, and where's the log
+./scripts/server.sh stop                    # SIGTERM (flight_server shuts down cleanly), then SIGKILL if it doesn't
+
+# on each player's machine:
+./scripts/build_client.sh                             # builds flight_gdext, fetches/caches the matching Godot editor
+./scripts/start_client.sh                             # connects to 127.0.0.1:45300 (a server on this same machine)
+./scripts/start_client.sh --server 203.0.113.5        # connects to a server on another machine, default port
+./scripts/start_client.sh --server 203.0.113.5:45301  # ...and a non-default port
+```
+
+`start_client.sh` launches the Godot editor binary straight into `scenes/networked.tscn` (not the project's single-player default scene, and not the bare editor UI), so there's no "open the project, pick the scene, press Play" step. `--server` sets `SERVER_HOST`/`SERVER_PORT` environment variables that `PredictedAircraft::_ready()` reads as an override before falling back to its Inspector defaults (`127.0.0.1:45300`) — the same environment-variable configuration pattern `headless_test_driver.gd` (`godot/scripts/`) already uses for `TEST_SCENARIO`, just read in C++ here since `server_host`/`server_port` are already this node's own properties. Extra arguments (`--max-clients`, `--snapshot-hz`, `--stress-aircraft`, ...) pass straight through `server.sh start` to `flight_server`.
+
+Both build scripts, and `scripts/run_tests.sh`, share one CMake `build/` directory and one `.godot-tools` Godot-binary cache, so running any of them after another only builds or fetches what's actually missing.
+
 ### Running a server and connecting manually
+
+The scripts above are the fast path; this is the manual equivalent, useful if you want the Godot editor UI itself open (to inspect the scene tree, use breakpoints, etc.) rather than just running the game.
 
 Start a server (defaults to port 45300, 30 Hz snapshots):
 
@@ -96,7 +120,7 @@ Every additional Godot client that connects to the same server gets its own airc
 ./build/flight_server --max-clients 8
 ```
 
-Open `scenes/networked.tscn` in as many separate Godot instances as you want players (each one just needs `PredictedAircraft`'s `server_host`/`server_port` pointed at the same server) and press Play in each. There is no separate "join" step beyond connecting: the scene's own `RemoteAircraftSpawner` node notices each other player the moment their aircraft first appears in a received snapshot and instances a `RemoteAircraft` for it (rendered with a different colour scheme from your own aircraft so it's visually obvious which is which), freeing it again the moment that player disconnects.
+Open `scenes/networked.tscn` in as many separate Godot instances as you want players (each one just needs `PredictedAircraft`'s `server_host`/`server_port` pointed at the same server) and press Play in each — or, for players on separate machines, each one runs `./scripts/start_client.sh --server <host running flight_server>` instead. There is no separate "join" step beyond connecting: the scene's own `RemoteAircraftSpawner` node notices each other player the moment their aircraft first appears in a received snapshot and instances a `RemoteAircraft` for it (rendered with a different colour scheme from your own aircraft so it's visually obvious which is which), freeing it again the moment that player disconnects.
 
 To exercise the server's multi-client and chunking machinery without launching multiple Godot instances, `flight_test_client --mode multiclient` connects several simulated clients in one process:
 

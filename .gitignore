@@ -3,6 +3,10 @@
 /.godot-tools/
 /godot/bin/*.so
 
+# scripts/server.sh's PID file and log for a human-tester-started server -
+# analogous to /results/, runtime output rather than tracked content.
+/run/
+
 # Editor "last opened with" bookkeeping - contains an absolute path to
 # whatever Godot executable last opened the project locally, not portable
 # across machines. Regenerated automatically the next time the project is

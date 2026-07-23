@@ -17,6 +17,7 @@
 
 #include "geo/aircraft_orientation.h"
 
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/basis.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
@@ -88,6 +89,21 @@ void PredictedAircraft::_ready() {
         return;
     }
     enetInitialized_ = true;
+
+    // SERVER_HOST/SERVER_PORT let scripts/start_client.sh point a launched
+    // client at a real server without editing the Inspector-set
+    // server_host/server_port properties by hand - same pattern as
+    // headless_test_driver.gd's TEST_SCENARIO, just read here in C++
+    // instead of GDScript since server_host/server_port are already this
+    // node's own properties.
+    OS* os = OS::get_singleton();
+    if (os->has_environment("SERVER_HOST")) {
+        serverHost_ = os->get_environment("SERVER_HOST");
+    }
+    if (os->has_environment("SERVER_PORT")) {
+        serverPort_ = os->get_environment("SERVER_PORT").to_int();
+    }
+
     std::string host(serverHost_.utf8().get_data());
     std::string error;
     if (!client_.connect(host, static_cast<uint16_t>(serverPort_), error)) {
