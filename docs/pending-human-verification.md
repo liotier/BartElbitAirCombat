@@ -27,10 +27,20 @@ the check.
   simultaneously (or one Godot client alongside a `flight_test_client
   --mode multiclient`-simulated peer) and confirm *other* players'
   aircraft render smoothly via `interpcore` — no visible stutter on
-  ordinary snapshot jitter, no obvious "snap." Not built yet (increment 5
-  is still a draft specification, `docs/increment-5-specification.md`);
-  add the "what's already verified automatically" note here once
-  implemented, matching the increment-4 entry above.
+  ordinary snapshot jitter, no obvious "snap." Steps are in README.md,
+  "Flying with other players." What's already been verified by the
+  agent, so this is purely the qualitative "does it look right"
+  judgement, not a correctness check: `flight_test_client --mode
+  multiclient` connects several real clients against a live server and
+  confirms, in `scripts/run_tests.sh`, distinct player-ID assignment, no
+  cross-talk between clients' own aircraft (measured: opposite-signed
+  elevator input produces opposite-signed altitude deltas), live
+  `interpcore`-based tracking of other clients' aircraft within ~5 m of
+  their raw broadcast altitude, and chunked-snapshot correctness with
+  zero duplicates at aircraft counts spanning the chunking boundary
+  (16/17/30/32 total aircraft). The interpolation math and data path are
+  exercised and correct end to end; only the visual smoothness judgement
+  itself needs a human with a display.
 
 - [ ] **Real joystick/HOTAS input, once implemented** — not built yet (see
   "Not yet scheduled" below). Once it is: confirm a real device's axes map
