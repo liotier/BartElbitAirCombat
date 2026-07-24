@@ -39,13 +39,21 @@
 
 #include <enet/enet.h>
 
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -71,16 +79,19 @@ struct Config {
     // shared by every aircraft it manages (real clients, --stress-aircraft
     // synthetic aircraft) - a whole-session setting, not per-client.
     std::string aircraft = "c172x";
-    // Increment 5 ("Wire protocol changes" / "Open questions"): real
-    // client capacity. Suggested default 8 (up from increment 3-4's
-    // hardcoded 4) - the CPU/wire-format headroom comfortably supports
-    // more; a modest default avoids over-promising before a real
-    // playtest.
-    int maxClients = 8;
+    // Increment 7 (docs/increment-7-specification.md, "Server-side
+    // capacity, spawn, and CPU-leveling"): replaces increment 5's
+    // --max-clients. maxBots fill the airspace when otherwise empty;
+    // maxPlayers is the additive threshold of humans admitted on top of
+    // bots before bots start yielding one-for-one - true human capacity is
+    // maxBots+maxPlayers, not maxPlayers alone. Defaults (0 bots, 8
+    // players) degenerate to increment 5's old --max-clients behaviour.
+    int maxBots = 0;
+    int maxPlayers = 8;
     // Increment 5 test-only flag: synthetic, unpiloted, trimmed-and-
     // flying aircraft purely to inflate the aircraft count for chunking-
     // boundary testing (spec, "Test plan" item 7) - never counted against
-    // maxClients, never touched by any client's input.
+    // maxBots/maxPlayers, never touched by any client's input.
     int stressAircraft = 0;
 };
 
@@ -99,8 +110,10 @@ Config parseArgs(int argc, char** argv) {
             cfg.scenario = nextVal();
         } else if (arg == "--log-name") {
             cfg.logName = nextVal();
-        } else if (arg == "--max-clients") {
-            cfg.maxClients = std::atoi(nextVal().c_str());
+        } else if (arg == "--max-players") {
+            cfg.maxPlayers = std::atoi(nextVal().c_str());
+        } else if (arg == "--max-bots") {
+            cfg.maxBots = std::atoi(nextVal().c_str());
         } else if (arg == "--stress-aircraft") {
             cfg.stressAircraft = std::atoi(nextVal().c_str());
         } else if (arg == "--aircraft") {
@@ -164,12 +177,28 @@ enum class AircraftKind { kScripted, kClient, kStress };
 // thread's roster (`aircraft` in main()) and mutated only between barrier
 // calls (see SpinBarrier's comment) - workers read/step their assigned
 // slice each tick but never resize or reorder the roster itself.
+//
+// Increment 7 (docs/increment-7-specification.md, "One unified bot
+// interface"): a bot is just a kClient whose ClientHello declared it one -
+// zero new AircraftKind, zero new branching in the command-buffer/
+// worker-pool stepping code below, matching "no server-side special-
+// casing beyond the fork/track bookkeeping" (acceptance criterion 2).
+// isBot/botPid/beingDisplaced are meaningful only when kind == kClient
+// && isBot; a *local* bot's botPid is the forked child process this
+// server itself owns and must signal/reap (spec, "Spawn/despawn
+// mechanism") - a future remote bot would leave botPid at -1.
 struct Aircraft {
     AircraftKind kind;
     uint8_t playerId = 0;
     std::unique_ptr<inc1::FlightSession> session;
     ENetPeer* peer = nullptr;  // kClient only
     CommandBuffer cmdBuf;      // kClient only
+    bool isBot = false;
+    pid_t botPid = -1;
+    // Set the moment this bot is chosen to be displaced (SIGTERM sent) so
+    // it is never chosen again while its disconnect is still in flight
+    // (docs/increment-7-specification.md, "Displacement sequencing").
+    bool beingDisplaced = false;
 };
 
 // A client whose FlightSession is being constructed off the tick-stepping
@@ -181,6 +210,7 @@ struct Aircraft {
 struct PendingOnboard {
     ENetPeer* peer = nullptr;
     uint8_t playerId = 0;
+    bool isBot = false;
     bool cancelled = false;
     std::future<std::unique_ptr<inc1::FlightSession>> future;
 };
@@ -236,6 +266,34 @@ std::unique_ptr<inc1::FlightSession> onboardNewAircraft(
     double eastOffsetM = 50.0 * static_cast<double>(playerId - 1);
     offsetSessionPosition(*s, eastOffsetM, 0.0, originLat, originLon);
     return s;
+}
+
+// Increment 7 (docs/increment-7-specification.md, "Spawn/despawn
+// mechanism"): flight_bot is a sibling binary in the same build output
+// directory. Resolved via /proc/self/exe (Linux-specific, matching this
+// project's own "Linux-first" vision, docs/roadmap.md) rather than
+// argv[0], which may be relative to a cwd this process no longer has by
+// the time a bot needs spawning.
+std::string resolveBotBinaryPath() {
+    std::error_code ec;
+    std::filesystem::path exePath =
+        std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec) return "flight_bot";  // best-effort fallback: rely on PATH/cwd
+    return (exePath.parent_path() / "flight_bot").string();
+}
+
+// Blocking wait with a bounded SIGKILL fallback (mirrors scripts/
+// server.sh's own SIGTERM-then-SIGKILL-after-timeout idiom, applied at
+// the process level): used only at server shutdown, so one hung bot
+// child can never block the server from actually exiting.
+void waitForExitOrKill(pid_t pid) {
+    for (int i = 0; i < 50; ++i) {
+        int status = 0;
+        if (waitpid(pid, &status, WNOHANG) == pid) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, nullptr, 0);
 }
 
 }  // namespace
@@ -338,7 +396,8 @@ int main(int argc, char** argv) {
     // refused by ENet itself before any message exchange can occur
     // (increment 3 finding, unchanged reasoning).
     if (!server.start(config.port,
-                       static_cast<size_t>(config.maxClients) + 4, error)) {
+                       static_cast<size_t>(config.maxBots + config.maxPlayers) + 4,
+                       error)) {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         enet_deinitialize();
         return 2;
@@ -354,11 +413,13 @@ int main(int argc, char** argv) {
 
     // player_id allocation pool (networked mode only): index 0 unused
     // (0 is reserved as "no client" elsewhere in the wire protocol),
-    // [1, maxClients] is the real pool. Stress aircraft use a separate
-    // range starting at 200 (review finding M2), so they never interact
-    // with this pool or the capacity check below.
-    std::vector<bool> playerIdInUse(static_cast<size_t>(config.maxClients) + 1,
-                                     false);
+    // [1, maxBots+maxPlayers] is the real pool - shared by humans and
+    // bots alike (a bot is just a kClient, see Aircraft's own comment).
+    // Stress aircraft use a separate range starting at 200 (review
+    // finding M2), so they never interact with this pool or the capacity
+    // check below.
+    std::vector<bool> playerIdInUse(
+        static_cast<size_t>(config.maxBots + config.maxPlayers) + 1, false);
     std::vector<PendingOnboard> pendingOnboards;
 
     if (scripted) {
@@ -385,6 +446,133 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Increment 7 bot capacity/CPU-leveling state (docs/increment-7-
+    // specification.md, "Server-side capacity, spawn, and CPU-leveling").
+    // pendingBotPids: forked, not yet matched to an onboarded Aircraft (the
+    // window between fork() and this server observing that bot's own
+    // ClientHello) - counted toward the target so a connect burst cannot
+    // over-spawn (spec: "counts toward the target the moment it is
+    // fork()ed"). waitingHumanPeers: humans admitted past the additive
+    // threshold, parked until a bot's *actual* disconnect is processed -
+    // never onboarded merely behind the earlier SIGTERM (review finding
+    // M1).
+    std::deque<pid_t> pendingBotPids;
+    std::deque<ENetPeer*> waitingHumanPeers;
+    const std::string botBinaryPath = resolveBotBinaryPath();
+
+    auto currentHumanCount = [&]() -> int {
+        int count = static_cast<int>(waitingHumanPeers.size());
+        for (const auto& po : pendingOnboards) {
+            if (!po.isBot) ++count;
+        }
+        for (const auto& a : aircraft) {
+            if (a->kind == AircraftKind::kClient && !a->isBot) ++count;
+        }
+        return count;
+    };
+
+    auto spawnBot = [&]() {
+        pid_t pid = fork();
+        if (pid < 0) {
+            std::fprintf(stderr, "error: fork() for bot spawn failed: %s\n",
+                         std::strerror(errno));
+            return;
+        }
+        if (pid == 0) {
+            // Child: defence in depth for a crashed parent (spec,
+            // "Spawn/despawn mechanism") - the primary crash-safety
+            // mechanism is flight_bot's own exit-on-connection-loss; this
+            // just makes the common case faster.
+            prctl(PR_SET_PDEATHSIG, SIGTERM);
+            std::string portStr = std::to_string(config.port);
+            execl(botBinaryPath.c_str(), botBinaryPath.c_str(), "--host",
+                  "127.0.0.1", "--port", portStr.c_str(), "--aircraft",
+                  config.aircraft.c_str(), static_cast<char*>(nullptr));
+            std::fprintf(stderr, "error: execl('%s') failed: %s\n",
+                         botBinaryPath.c_str(), std::strerror(errno));
+            _exit(127);
+        }
+        pendingBotPids.push_back(pid);
+    };
+
+    // Moves the live bot count toward the owner's load-model target (spec:
+    // "the airspace fills to B bots when empty... humans beyond P each
+    // displace one bot"): desiredBots = clamp(B+P-humanCount, 0, B) covers
+    // both the fill-to-B and the displace-past-P regimes with one formula,
+    // and naturally refills a bot when a human disconnect raises it back
+    // up (test-plan item 4). Called after every admission decision and
+    // every disconnect (spec: "driven toward this target on each actual
+    // ENet connect/disconnect event").
+    auto reconcileBotCount = [&]() {
+        int humanCount = currentHumanCount();
+        int desiredBots = std::clamp(
+            config.maxBots + config.maxPlayers - humanCount, 0, config.maxBots);
+        int totalBotCount = static_cast<int>(pendingBotPids.size());
+        int beingDisplacedCount = 0;
+        std::vector<Aircraft*> displaceable;
+        for (auto& a : aircraft) {
+            if (a->kind == AircraftKind::kClient && a->isBot) {
+                ++totalBotCount;
+                if (a->beingDisplaced) {
+                    ++beingDisplacedCount;
+                } else {
+                    displaceable.push_back(a.get());
+                }
+            }
+        }
+        if (totalBotCount > desiredBots) {
+            int needToSignal = (totalBotCount - desiredBots) - beingDisplacedCount;
+            for (int i = 0; i < needToSignal &&
+                            i < static_cast<int>(displaceable.size());
+                 ++i) {
+                displaceable[i]->beingDisplaced = true;
+                kill(displaceable[i]->botPid, SIGTERM);
+            }
+        } else if (totalBotCount < desiredBots) {
+            for (int i = 0; i < desiredBots - totalBotCount; ++i) spawnBot();
+        }
+    };
+
+    // Reaps any exited bot child (despawned, crashed, or a failed spawn) so
+    // it never becomes a zombie; called once per tick. Deliberately
+    // decoupled from any specific ENet disconnect event - a bot's OS
+    // process can exit slightly before or after its ENet DISCONNECT is
+    // observed, and this needs no correlation between the two, just "reap
+    // whatever has exited."
+    auto reapExitedChildren = [&]() {
+        int status = 0;
+        pid_t pid;
+        while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            pendingBotPids.erase(
+                std::remove(pendingBotPids.begin(), pendingBotPids.end(), pid),
+                pendingBotPids.end());
+        }
+    };
+
+    auto allocatePlayerId = [&]() -> uint8_t {
+        for (uint8_t candidate = 1;
+             candidate <= static_cast<uint8_t>(config.maxBots + config.maxPlayers);
+             ++candidate) {
+            if (!playerIdInUse[candidate]) return candidate;
+        }
+        return 0;  // exhausted - should not happen given the capacity checks
+    };
+
+    auto startOnboarding = [&](ENetPeer* peer, uint8_t pid, bool isBot) {
+        playerIdInUse[pid] = true;
+        PendingOnboard po;
+        po.peer = peer;
+        po.playerId = pid;
+        po.isBot = isBot;
+        po.future = std::async(std::launch::async, onboardNewAircraft, pid,
+                                originLat, originLon, std::cref(*catalogEntry));
+        pendingOnboards.push_back(std::move(po));
+    };
+
+    if (!scripted) {
+        reconcileBotCount();  // spawns the initial --max-bots fleet
+    }
+
     auto onEvent = [&](const ENetEvent& event) {
         if (scripted) return;  // scripted mode accepts no clients at all
 
@@ -397,13 +585,32 @@ int main(int argc, char** argv) {
                     net::PlayerLeft left{pid};
                     server.broadcast(net::kChannelReliable,
                                       net::serializePlayerLeft(left), true);
+                    bool wasBot = aircraft[i]->isBot;
                     aircraft.erase(aircraft.begin() + i);
+                    // Increment 7 (review finding M1): a freed bot slot
+                    // goes to the longest-waiting displaced human FIRST -
+                    // its onboarding starts only now, never merely behind
+                    // the earlier SIGTERM.
+                    if (wasBot && !waitingHumanPeers.empty()) {
+                        ENetPeer* waitingPeer = waitingHumanPeers.front();
+                        waitingHumanPeers.pop_front();
+                        startOnboarding(waitingPeer, allocatePlayerId(),
+                                        /*isBot=*/false);
+                    }
+                    // humanCount may also have just dropped (a human
+                    // disconnected) - this refills a bot toward B
+                    // (test-plan item 4).
+                    reconcileBotCount();
                     break;
                 }
             }
             for (auto& p : pendingOnboards) {
                 if (p.peer == event.peer) p.cancelled = true;
             }
+            waitingHumanPeers.erase(
+                std::remove(waitingHumanPeers.begin(), waitingHumanPeers.end(),
+                            event.peer),
+                waitingHumanPeers.end());
             return;
         }
         if (event.type != ENET_EVENT_TYPE_RECEIVE) return;
@@ -432,35 +639,39 @@ int main(int argc, char** argv) {
                     // delivery.
                     return;
                 }
-                size_t reservedSlots = pendingOnboards.size();
-                for (auto& a : aircraft) {
-                    if (a->kind == AircraftKind::kClient) ++reservedSlots;
-                }
-                if (reservedSlots >= static_cast<size_t>(config.maxClients)) {
-                    net::ServerReject reject{
-                        static_cast<uint8_t>(net::RejectReason::kServerFull)};
-                    server.send(event.peer, net::kChannelReliable,
-                                net::serializeServerReject(reject), true);
-                    server.flush();
-                    return;
-                }
-                uint8_t pid = 0;
-                for (uint8_t candidate = 1;
-                     candidate <= static_cast<uint8_t>(config.maxClients);
-                     ++candidate) {
-                    if (!playerIdInUse[candidate]) {
-                        pid = candidate;
+                bool isBot = (hello.client_flags & net::kClientFlagIsBot) != 0;
+                // Increment 7 (docs/increment-7-specification.md, "One
+                // unified bot interface"): a bot is only ever this
+                // server's own forked child in this increment (remote-bot
+                // admission policy is explicitly deferred) -
+                // reconcileBotCount() already forks exactly as many bots
+                // as the capacity model wants, so a bot's own ClientHello
+                // is admitted unconditionally rather than re-checked
+                // against the human ceiling below.
+                if (!isBot) {
+                    int humanCount = currentHumanCount();
+                    if (humanCount >= config.maxBots + config.maxPlayers) {
+                        // Terminal case (spec, "Server-side capacity...":
+                        // B+P humans already accounted for, no bot left
+                        // to displace.
+                        net::ServerReject reject{static_cast<uint8_t>(
+                            net::RejectReason::kServerFull)};
+                        server.send(event.peer, net::kChannelReliable,
+                                    net::serializeServerReject(reject), true);
+                        server.flush();
+                        return;
+                    }
+                    if (humanCount >= config.maxPlayers) {
+                        // Beyond the additive threshold: a bot must yield
+                        // first (finding M1) - parked, not onboarded,
+                        // until that actually happens.
+                        waitingHumanPeers.push_back(event.peer);
+                        reconcileBotCount();
                         break;
                     }
                 }
-                playerIdInUse[pid] = true;
-                PendingOnboard po;
-                po.peer = event.peer;
-                po.playerId = pid;
-                po.future = std::async(std::launch::async, onboardNewAircraft,
-                                        pid, originLat, originLon,
-                                        std::cref(*catalogEntry));
-                pendingOnboards.push_back(std::move(po));
+                startOnboarding(event.peer, allocatePlayerId(), isBot);
+                if (!isBot) reconcileBotCount();  // may lower desiredBots
                 break;
             }
             case net::MessageTag::kControlInput: {
@@ -578,6 +789,12 @@ int main(int argc, char** argv) {
     uint32_t tick = 0;
 
     auto stepOneTick = [&]() {
+        // Increment 7: reap any bot child that exited (despawned,
+        // crashed, or a failed spawn) before it can become a zombie -
+        // decoupled from any specific ENet event, see reapExitedChildren's
+        // own comment.
+        reapExitedChildren();
+
         // Main's between-tick work: drain any completed onboarding
         // (splicing the new aircraft into the roster and welcoming its
         // peer), then release the workers for this tick. All of this
@@ -595,6 +812,15 @@ int main(int argc, char** argv) {
                     a->playerId = po.playerId;
                     a->session = std::move(session);
                     a->peer = po.peer;
+                    a->isBot = po.isBot;
+                    if (po.isBot && !pendingBotPids.empty()) {
+                        // Matches this newly-onboarded bot to the oldest
+                        // still-unmatched forked PID (bots are fungible;
+                        // only the count, not the identity, of the pairing
+                        // matters - see pendingBotPids' own comment).
+                        a->botPid = pendingBotPids.front();
+                        pendingBotPids.pop_front();
+                    }
                     aircraft.push_back(std::move(a));
                     net::ServerWelcome welcome{
                         net::kProtocolVersion, po.playerId,
@@ -647,7 +873,14 @@ int main(int argc, char** argv) {
                     a->session->property("velocities/q-rad_sec"));
                 as.ang_vel_body_rps[2] = static_cast<float>(
                     a->session->property("velocities/r-rad_sec"));
-                as.status_flags = 0;
+                // Increment 7 (docs/increment-7-specification.md, "Marking
+                // bots as non-human"): set from the peer's own ClientHello
+                // self-declaration, uniform for local and (future) remote
+                // bots - never from fork-knowledge.
+                as.status_flags =
+                    (a->kind == AircraftKind::kClient && a->isBot)
+                        ? net::kStatusFlagBot
+                        : 0;
                 // Increment 5 (review finding, "Wire protocol changes"
                 // point 3): ack_client_seq is now per-aircraft, meaningful
                 // only to this aircraft's own owning client; 0 for
@@ -716,6 +949,23 @@ int main(int argc, char** argv) {
     poolStop.store(true, std::memory_order_relaxed);
     tickBarrier.arriveAndWait();  // release workers so they observe the stop
     for (auto& w : workers) w.join();
+
+    // Increment 7 (test-plan item 5): a clean server shutdown terminates
+    // every bot child with no orphans - both onboarded ones and any still
+    // mid-onboard/mid-connect. SIGTERM first for all of them (flight_bot
+    // handles it as a clean disconnect), then wait for each to actually
+    // exit; a hung child gets SIGKILLed rather than blocking shutdown
+    // forever (waitForExitOrKill).
+    {
+        std::vector<pid_t> allBotPids(pendingBotPids.begin(), pendingBotPids.end());
+        for (auto& a : aircraft) {
+            if (a->kind == AircraftKind::kClient && a->isBot) {
+                allBotPids.push_back(a->botPid);
+            }
+        }
+        for (pid_t pid : allBotPids) kill(pid, SIGTERM);
+        for (pid_t pid : allBotPids) waitForExitOrKill(pid);
+    }
 
     int exitCode = 0;
     if (scripted) {

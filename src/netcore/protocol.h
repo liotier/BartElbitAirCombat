@@ -36,8 +36,9 @@ namespace net {
 // instead of misinterpreting each other's bytes (spec, "Wire protocol").
 // Standing rule (docs/increment-6-specification.md, "Wire protocol
 // changes"): any change to a message's wire layout bumps this constant.
-// 2: increment 6 adds ServerWelcome.aircraft_id.
-constexpr uint8_t kProtocolVersion = 2;
+// 2: increment 6 adds ServerWelcome.aircraft_id. 3: increment 7 adds
+// ClientHello.client_flags.
+constexpr uint8_t kProtocolVersion = 3;
 
 // ENet channel assignment (spec, "Messages" table's Channel column).
 constexpr uint8_t kChannelReliable = 0;
@@ -89,8 +90,16 @@ enum class RejectReason : uint8_t {
     kServerFull = 2,
 };
 
+// Increment 7 (docs/increment-7-specification.md, "One unified bot
+// interface"): bit 0 of client_flags is a bot's own self-declaration - set
+// identically by a local (server-forked) bot and, in a future increment, a
+// remote one, so the server has exactly one "is a bot" code path. Other
+// bits reserved.
+constexpr uint8_t kClientFlagIsBot = 0x01;
+
 struct ClientHello {
     uint8_t protocol_version = kProtocolVersion;
+    uint8_t client_flags = 0;
 };
 
 struct ServerWelcome {
@@ -128,9 +137,15 @@ struct ControlInput {
     std::vector<ControlCommand> commands;
 };
 
+// Increment 7 (docs/increment-7-specification.md, "Marking bots as
+// non-human"): bit 0 of AircraftState.status_flags - set by the server for
+// any peer whose ClientHello declared it a bot (kClientFlagIsBot), clear
+// for humans. The first defined bit of a field increment 5 reserved.
+constexpr uint8_t kStatusFlagBot = 0x01;
+
 // One aircraft's rigid-body state within a StateSnapshot (spec, "Messages"
-// table's StateSnapshot row). status_flags is reserved for future
-// increments (e.g. crashed/on-ground); always 0 in increment 3.
+// table's StateSnapshot row). status_flags bit 0: see kStatusFlagBot;
+// other bits still reserved for future increments (e.g. crashed).
 struct AircraftState {
     uint8_t player_id = 0;
     float pos_local_m[3] = {0.0f, 0.0f, 0.0f};  // East, Up, -North

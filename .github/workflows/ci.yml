@@ -63,6 +63,16 @@ jobs:
       # re-run/scripted-guard steps (a few seconds total). On the order
       # of 90s added, confirmed to remain inside the existing 20-minute
       # budget.
+      #
+      # increment 7 spec, "Acceptance criteria" #10: adds
+      # bot_endurance_gate_test (pure numerical integration, no real-time
+      # pacing - three airframes at >=180s simulated cost under 3s wall-
+      # clock total) plus several short networked steps (bot appearance/
+      # marking/liveness ~12s, RemoteEntityTracker cross-awareness ~4s,
+      # the capacity/CPU-leveling model plus its refill check ~13s, clean
+      # and crash child-process lifecycle ~10s combined). On the order of
+      # 40s added, confirmed to remain inside the existing 20-minute
+      # budget.
       - name: Run full test suite
         run: ./scripts/run_tests.sh
 

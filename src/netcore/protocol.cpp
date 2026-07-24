@@ -127,6 +127,7 @@ ByteBuffer serializeClientHello(const ClientHello& msg) {
     ByteWriter w;
     w.putU8(static_cast<uint8_t>(MessageTag::kClientHello));
     w.putU8(msg.protocol_version);
+    w.putU8(msg.client_flags);
     return w.take();
 }
 
@@ -134,7 +135,7 @@ bool deserializeClientHello(const uint8_t* data, size_t len,
                              ClientHello& out) {
     ByteReader r(data, len);
     if (!checkTag(r, MessageTag::kClientHello)) return false;
-    return r.getU8(out.protocol_version);
+    return r.getU8(out.protocol_version) && r.getU8(out.client_flags);
 }
 
 ByteBuffer serializeServerWelcome(const ServerWelcome& msg) {

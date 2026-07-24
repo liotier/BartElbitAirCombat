@@ -234,3 +234,28 @@ add_executable(net_relay
     src/net_test/net_relay.cpp
 )
 target_compile_options(net_relay PRIVATE -Wall -Wextra)
+
+# Increment 7: flight_bot, a genuinely headless client (spec, "flight_bot:
+# a headless client with local physics") - the same real local
+# FlightSession + PredictedSession a human's Godot client runs, plus the
+# bot::ManeuverController "intelligence" behind the core/intelligence
+# seam. No Godot dependency; links flightcore, netcore, predictcore,
+# interpcore - the same libraries flight_test_client and the Godot client
+# already share, so it speaks byte-identical wire format and runs the
+# identical prediction/reconciliation code.
+add_executable(flight_bot
+    src/bot/main.cpp
+    src/bot/maneuver_controller.cpp
+)
+target_link_libraries(flight_bot PRIVATE flightcore netcore predictcore interpcore)
+target_compile_options(flight_bot PRIVATE -Wall -Wextra)
+
+# The increment-7 airborne-endurance gate (spec, "Test plan" item 1) - the
+# real bot::ManeuverController against a real FlightSession, standalone,
+# no server/client/ENet. Godot-free; links flightcore only.
+add_executable(bot_endurance_gate_test
+    src/bot/endurance_gate_test.cpp
+    src/bot/maneuver_controller.cpp
+)
+target_link_libraries(bot_endurance_gate_test PRIVATE flightcore)
+target_compile_options(bot_endurance_gate_test PRIVATE -Wall -Wextra)

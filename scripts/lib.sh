@@ -23,6 +23,11 @@ BUILD_DIR="$ROOT_DIR/build"
 RUN_DIR="$ROOT_DIR/run"
 
 FLIGHT_SERVER="$BUILD_DIR/flight_server"
+# Increment 7: flight_server forks this as a sibling binary (resolved via
+# /proc/self/exe, src/server/main.cpp's resolveBotBinaryPath()) whenever
+# --max-bots > 0 - must be built alongside flight_server, not just fetched
+# on demand, or a server started with --max-bots silently spawns nothing.
+FLIGHT_BOT="$BUILD_DIR/flight_bot"
 FLIGHT_GDEXT="$ROOT_DIR/godot/bin/libflight_gdext.so"
 
 # Same version/asset/URL scripts/run_tests.sh uses, kept identical so both

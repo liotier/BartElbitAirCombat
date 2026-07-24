@@ -36,11 +36,16 @@
 # aircraft_id round-trip + sustained flight + the airframe-independent
 # prediction criteria, aircraft-type mismatch behaviour (default
 # disconnect, override, matched-silent), a multiclient re-run under a
-# non-c172x type, and the scripted-mode guard. All pass/fail evaluation
-# happens inside the test binaries or the headless test driver script;
-# this script only configures, builds, fetches Godot, invokes everything,
-# starts/stops the server and relay processes it needs, and relays exit
-# status.
+# non-c172x type, and the scripted-mode guard - then the increment-7 bot
+# phase (docs/increment-7-specification.md, "Test plan"): the airborne-
+# endurance gate, --max-bots bot appearance/marking/liveness, bot
+# RemoteEntityTracker cross-awareness, the --max-bots/--max-players
+# capacity/CPU-leveling model (displacement, refill, the terminal
+# kServerFull case), and clean/crash child-process lifecycle (no orphans
+# either way). All pass/fail evaluation happens inside the test binaries
+# or the headless test driver script; this script only configures,
+# builds, fetches Godot, invokes everything, starts/stops the server and
+# relay processes it needs, and relays exit status.
 #
 # Exit codes: 0 all tests passed, 1 a test failed, 2 a required tool is
 # missing, 3 cmake configure failed, 4 the build failed, 5 the increment 1
@@ -143,6 +148,7 @@ NET_RELAY="$BUILD_DIR/net_relay"
 PREDICTCORE_TESTS="$BUILD_DIR/predictcore_tests"
 INTERPCORE_TESTS="$BUILD_DIR/interpcore_tests"
 CATALOG_TESTS="$BUILD_DIR/catalog_tests"
+BOT_ENDURANCE_GATE_TEST="$BUILD_DIR/bot_endurance_gate_test"
 NET_PORT=45300
 RELAY_PORT=45301
 
@@ -405,10 +411,11 @@ set -e
 # cross-talk between clients' own aircraft, live interpcore-based tracking
 # of other clients' aircraft (test-plan items 5, 8), plus capacity
 # (kServerFull) and slot reuse after a disconnect (test 6) - a small
-# --max-clients so the 4th connection attempt in this same run is a real
-# over-capacity case.
+# --max-players (increment 7 renamed increment 5's --max-clients; 0 bots
+# here, so it behaves identically) so the 4th connection attempt in this
+# same run is a real over-capacity case.
 echo "-- multiclient: distinct IDs, no cross-talk, live tracking, capacity/slot-reuse --"
-"$FLIGHT_SERVER" --port "$NET_PORT" --snapshot-hz 30 --max-clients 3 \
+"$FLIGHT_SERVER" --port "$NET_PORT" --snapshot-hz 30 --max-players 3 \
   --log-name networked_multiclient &
 CURRENT_SERVER_PID=$!
 sleep 1
@@ -432,7 +439,7 @@ NET5_CHUNK_STATUS=0
 for total in 16 17 30 32; do
   stress=$((total - 2))
   echo "-- chunking: $total total aircraft (2 real + $stress stress) --"
-  "$FLIGHT_SERVER" --port "$NET_PORT" --snapshot-hz 30 --max-clients 8 \
+  "$FLIGHT_SERVER" --port "$NET_PORT" --snapshot-hz 30 --max-players 8 \
     --stress-aircraft "$stress" --log-name "networked_chunk_${total}" &
   CURRENT_SERVER_PID=$!
   sleep 1.5
@@ -588,7 +595,7 @@ cleanup_net_procs
 # (test-plan item 5) - confirms the airframe choice is orthogonal to
 # everything increment 5 built, not merely individually compatible.
 echo "-- multiclient re-run: --aircraft camel --"
-"$FLIGHT_SERVER" --aircraft camel --port "$NET_PORT" --snapshot-hz 30 --max-clients 3 \
+"$FLIGHT_SERVER" --aircraft camel --port "$NET_PORT" --snapshot-hz 30 --max-players 3 \
   --log-name networked_multiclient_camel &
 CURRENT_SERVER_PID=$!
 sleep 1
@@ -626,9 +633,151 @@ for status in "$CATALOG_STATUS" "$NET6_PREDICT_STATUS" "$MISMATCH_DEFAULT_STATUS
   fi
 done
 
+echo "== Running increment 7 bot tests =="
+trap cleanup_net_procs EXIT
+
+# Step: airborne-endurance gate (test-plan item 1, the acceptance test
+# this increment lives or dies by) - the real bot::ManeuverController
+# against a real FlightSession, standalone, no server/client needed.
+echo "-- bot airborne-endurance gate (c172x, Camel, pa28; >=180s each) --"
+set +e
+"$BOT_ENDURANCE_GATE_TEST"
+ENDURANCE_STATUS=$?
+set -e
+
+# Step: --max-bots with no other humans - bot player_ids appear, each
+# marked non-human and genuinely evolving/bounded (test-plan item 2), the
+# real distinction from a frozen --stress-aircraft. --max-players 1 gives
+# the observing flight_test_client connection itself room to sit "on top
+# of" the bots without displacing one (this connection is unavoidably a
+# real, non-bot peer from the server's point of view).
+echo "-- --max-bots 3: bots appear, marked non-human, evolving --"
+"$FLIGHT_SERVER" --max-bots 3 --max-players 1 --port "$NET_PORT" --snapshot-hz 30 \
+  --log-name networked_bots_only &
+CURRENT_SERVER_PID=$!
+sleep 2
+
+set +e
+"$FLIGHT_TEST_CLIENT" --mode observe_bots --host 127.0.0.1 --port "$NET_PORT" \
+  --expect-bot-count 3 --duration-s 10
+OBSERVE_BOTS_STATUS=$?
+set -e
+
+cleanup_net_procs
+
+# Step: RemoteEntityTracker cross-awareness (test-plan item 7) - two bots,
+# each aware of the other via its own perception path (future combat AI's
+# eventual input). Bots inherit the server's stdout across fork() and log
+# their own tracked-other count once per simulated second.
+echo "-- bot RemoteEntityTracker cross-awareness (2 bots aware of each other) --"
+"$FLIGHT_SERVER" --max-bots 2 --max-players 0 --port "$NET_PORT" --snapshot-hz 30 \
+  --log-name networked_bots_tracking > "$RESULTS_DIR/server_bots_tracking.log" 2>&1 &
+CURRENT_SERVER_PID=$!
+sleep 3
+if grep -q "tracked_others=1" "$RESULTS_DIR/server_bots_tracking.log"; then
+  BOT_TRACKING_STATUS=0
+else
+  echo "error: no bot reported tracking another bot" >&2
+  BOT_TRACKING_STATUS=1
+fi
+echo "bot_cross_awareness: $([ "$BOT_TRACKING_STATUS" -eq 0 ] && echo PASS || echo FAIL)"
+
+cleanup_net_procs
+
+# Step: capacity/CPU-leveling model (test-plan item 3) - bots fill to B
+# when empty, humans add on top up to P then displace bots one-for-one
+# (the displacing human's slot allocated only after the bot's actual
+# disconnect is processed, finding M1), total never exceeds B+P, and the
+# terminal kServerFull case fires only once all B+P slots are human.
+# Reuses increment 5's own multiclient machinery (distinct IDs - so no
+# double-allocation ever occurred - no cross-talk, capacity/slot-reuse)
+# plus the humans_not_marked_bot check (test-plan item 8).
+echo "-- capacity/CPU-leveling: --max-bots 2 --max-players 3 (B+P=5) --"
+"$FLIGHT_SERVER" --max-bots 2 --max-players 3 --port "$NET_PORT" --snapshot-hz 30 \
+  --log-name networked_bots_capacity &
+CURRENT_SERVER_PID=$!
+sleep 2
+
+set +e
+"$FLIGHT_TEST_CLIENT" --mode multiclient --host 127.0.0.1 --port "$NET_PORT" \
+  --num-clients 5 --test-capacity --expect-total-aircraft 5
+CAPACITY_STATUS=$?
+set -e
+
+# Step: a human disconnect refills a bot (test-plan item 4) - the
+# multiclient run above already disconnected every one of its clients by
+# the time it returned, so the server should already have reconciled back
+# toward --max-bots by now.
+sleep 1
+set +e
+"$FLIGHT_TEST_CLIENT" --mode observe_bots --host 127.0.0.1 --port "$NET_PORT" \
+  --expect-bot-count 2 --duration-s 6
+REFILL_STATUS=$?
+set -e
+
+cleanup_net_procs
+trap - EXIT
+
+# Step: child-process lifecycle, clean (test-plan item 5) - SIGTERM to
+# flight_server terminates every bot child, no orphans. flight_server's
+# own shutdown path blocks until every bot child actually exits before it
+# returns, so no orphan is possible by the time `wait` below unblocks;
+# the brief sleep is only for the OS process table to catch up for `ps`.
+echo "-- child-process lifecycle: clean SIGTERM, no orphans --"
+"$FLIGHT_SERVER" --max-bots 3 --max-players 0 --port "$NET_PORT" --snapshot-hz 30 \
+  --log-name networked_bots_shutdown_clean &
+CLEAN_SERVER_PID=$!
+sleep 2
+kill -TERM "$CLEAN_SERVER_PID" || true
+wait "$CLEAN_SERVER_PID" 2>/dev/null || true
+sleep 0.3
+if pgrep -f flight_bot >/dev/null 2>&1; then
+  echo "error: bot child(ren) survived a clean server shutdown" >&2
+  CLEAN_SHUTDOWN_STATUS=1
+else
+  CLEAN_SHUTDOWN_STATUS=0
+fi
+echo "bot_clean_shutdown_no_orphans: $([ "$CLEAN_SHUTDOWN_STATUS" -eq 0 ] && echo PASS || echo FAIL)"
+
+# Step: child-process lifecycle, crash (test-plan item 6, finding m1) -
+# SIGKILL the server itself, so it can run no cleanup code at all; its
+# bots must exit on their own (PDEATHSIG fast path, or ENet connection-
+# loss detection as the backstop) - polled for, since this genuinely
+# takes a little real wall-clock time, unlike the clean-shutdown case.
+echo "-- child-process lifecycle: server crash (SIGKILL), bots self-exit --"
+"$FLIGHT_SERVER" --max-bots 3 --max-players 0 --port "$NET_PORT" --snapshot-hz 30 \
+  --log-name networked_bots_shutdown_crash &
+CRASH_SERVER_PID=$!
+sleep 2
+kill -KILL "$CRASH_SERVER_PID" || true
+wait "$CRASH_SERVER_PID" 2>/dev/null || true
+CRASH_SHUTDOWN_STATUS=1
+for _ in $(seq 1 30); do
+  if ! pgrep -f flight_bot >/dev/null 2>&1; then
+    CRASH_SHUTDOWN_STATUS=0
+    break
+  fi
+  sleep 0.2
+done
+if [ "$CRASH_SHUTDOWN_STATUS" -ne 0 ]; then
+  echo "error: bot child(ren) survived the server's SIGKILL (crash safety, finding m1)" >&2
+  pkill -KILL -f flight_bot 2>/dev/null || true
+fi
+echo "bot_crash_safety_no_orphans: $([ "$CRASH_SHUTDOWN_STATUS" -eq 0 ] && echo PASS || echo FAIL)"
+
+NET7_OVERALL_STATUS=0
+for status in "$ENDURANCE_STATUS" "$OBSERVE_BOTS_STATUS" "$BOT_TRACKING_STATUS" \
+              "$CAPACITY_STATUS" "$REFILL_STATUS" "$CLEAN_SHUTDOWN_STATUS" \
+              "$CRASH_SHUTDOWN_STATUS"; do
+  if [ "$status" -ne 0 ]; then
+    NET7_OVERALL_STATUS=1
+  fi
+done
+
 if [ "$BINARY_STATUS" -ne 0 ] || [ "$GODOT_OVERALL_STATUS" -ne 0 ] || \
    [ "$NET3_OVERALL_STATUS" -ne 0 ] || [ "$NET4_OVERALL_STATUS" -ne 0 ] || \
-   [ "$NET5_OVERALL_STATUS" -ne 0 ] || [ "$NET6_OVERALL_STATUS" -ne 0 ]; then
+   [ "$NET5_OVERALL_STATUS" -ne 0 ] || [ "$NET6_OVERALL_STATUS" -ne 0 ] || \
+   [ "$NET7_OVERALL_STATUS" -ne 0 ]; then
   exit 1
 fi
 exit 0

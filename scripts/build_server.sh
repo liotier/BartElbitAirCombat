@@ -16,11 +16,15 @@
 
 # Builds only what a dedicated server host needs: the standalone
 # flight_server binary and its dependencies (flightcore, netcore,
-# Threads). CMake's configure step still fetches godot-cpp too (the top-
-# level CMakeLists.txt fetches all three third-party dependencies
-# unconditionally), but building only the flight_server target skips
-# compiling it - godot-cpp's own several hundred source files are most of
-# scripts/run_tests.sh's build time, and a server host never needs them.
+# Threads), plus flight_bot (predictcore, interpcore too) - flight_server
+# forks it as a sibling binary whenever --max-bots > 0 (src/server/
+# main.cpp's resolveBotBinaryPath()), so it must already exist alongside
+# flight_server, not be built on first use. CMake's configure step still
+# fetches godot-cpp too (the top-level CMakeLists.txt fetches all three
+# third-party dependencies unconditionally), but building only these two
+# targets skips compiling it - godot-cpp's own several hundred source
+# files are most of scripts/run_tests.sh's build time, and a server host
+# never needs them.
 #
 # Exit codes: 0 success, 2 a required tool is missing, 3 cmake configure
 # failed, 4 the build failed.
@@ -41,12 +45,13 @@ if ! cmake -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release; then
   exit 3
 fi
 
-echo "== Building flight_server =="
-if ! cmake --build "$BUILD_DIR" --target flight_server --parallel "$(nproc_or_default)"; then
+echo "== Building flight_server + flight_bot =="
+if ! cmake --build "$BUILD_DIR" --target flight_server flight_bot --parallel "$(nproc_or_default)"; then
   echo "error: build failed" >&2
   exit 4
 fi
 
 echo
 echo "Built: $FLIGHT_SERVER"
+echo "       $FLIGHT_BOT"
 echo "Start it with: ./scripts/server.sh start"

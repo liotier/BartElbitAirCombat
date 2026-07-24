@@ -56,6 +56,27 @@ the check.
   (immediate response, bounded-envelope tracking, forced-desync recovery)
   as c172x, all exercised automatically in `scripts/run_tests.sh`.
 
+- [ ] **Increment 7 acceptance criterion 11** — start a server with
+  `--max-bots` set (e.g. `./build/flight_server --max-bots 3 --max-players
+  8`), connect a Godot client (`./scripts/start_client.sh`), and confirm
+  bots visibly populate the airspace, are clearly distinguishable from
+  human players (the `RemoteAircraftSpawner`'s bot marker), and look
+  reasonably sane in flight for each catalog airframe. What's already been
+  verified by the agent, so this is purely the qualitative judgement, not
+  a liveness/correctness check: the airborne-endurance gate
+  (`bot_endurance_gate_test`) confirms all three airframes (c172x, Camel,
+  pa28) stay airborne and bounded for well over the required 3 minutes
+  with the real maneuver controller; `flight_test_client --mode
+  observe_bots` confirms bots appear promptly, carry the non-human
+  `status_flags` marker, and genuinely evolve (not a frozen
+  `--stress-aircraft`); and the capacity/displacement/refill model and
+  clean/crash child-process lifecycle are all exercised automatically in
+  `scripts/run_tests.sh`. Camel is included in the bot fleet (a
+  shallower-bank, gentler-pitch maneuver profile than the GA airframes
+  keeps it airborne - see `docs/increment-7-specification.md` Appendix B
+  and `bot::profileForToken`), so this check should cover all three, not
+  just c172x/pa28.
+
 - [ ] **Real joystick/HOTAS input, once implemented** — not built yet (see
   "Not yet scheduled" below). Once it is: confirm a real device's axes map
   sensibly (twist/pedal rudder, throttle slider), that Godot's default SDL

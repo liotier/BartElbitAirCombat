@@ -111,13 +111,19 @@ struct Config {
     int numClients = 3;
     // After the numClients connections above succeed, attempt one more
     // and assert it is rejected with kServerFull (test 6) - meaningful
-    // only when the server this runs against was started with
-    // --max-clients == numClients.
+    // only when the server this runs against was started with a total
+    // human capacity (--max-bots + --max-players) == numClients.
     bool testCapacity = false;
     // If >0, assert the total distinct player_id count observed across a
     // full tick's chunks equals this (test 7 - numClients plus whatever
     // --stress-aircraft count the server under test was started with).
     int expectTotalAircraft = 0;
+
+    // --mode observe_bots only (docs/increment-7-specification.md, "Test
+    // plan" items 2 and 8): expected count of non-human (status_flags bit
+    // 0) player_ids in the observed roster; 0 means "don't check the
+    // count, just report it."
+    int expectBotCount = 0;
 };
 
 Config parseArgs(int argc, char** argv) {
@@ -144,6 +150,7 @@ Config parseArgs(int argc, char** argv) {
         else if (arg == "--num-clients") cfg.numClients = std::atoi(nextVal().c_str());
         else if (arg == "--test-capacity") cfg.testCapacity = true;
         else if (arg == "--expect-total-aircraft") cfg.expectTotalAircraft = std::atoi(nextVal().c_str());
+        else if (arg == "--expect-bot-count") cfg.expectBotCount = std::atoi(nextVal().c_str());
     }
     return cfg;
 }
@@ -1041,6 +1048,113 @@ int runAircraftMismatchCheck(const Config& cfg) {
     return overall ? 0 : 1;
 }
 
+// docs/increment-7-specification.md, "Test plan" items 2 and 8: connects
+// as an ordinary (non-bot) observer and watches the broadcast roster for
+// cfg.durationS, asserting that every OTHER aircraft's non-human
+// (status_flags bit 0) marking matches expectations and that bot
+// aircraft's altitude actually evolves over the window - the distinction
+// from a frozen --stress-aircraft, which a --max-bots connection could
+// otherwise be mistaken for at the wire level. No local FlightSession; a
+// pure wire-level observer (this connection itself counts as one human
+// against --max-players, same as any other client).
+int runObserveBotsMode(const Config& cfg) {
+    if (enet_initialize() != 0) {
+        std::fprintf(stderr, "error: enet_initialize failed\n");
+        return 2;
+    }
+    net::NetClient client;
+    std::string error;
+    if (!client.connect(cfg.host, cfg.port, error)) {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        enet_deinitialize();
+        return 2;
+    }
+    if (!waitForConnect(client, 5000)) {
+        std::printf("connect: FAIL\n");
+        enet_deinitialize();
+        return 1;
+    }
+    HandshakeOutcome hs = doHandshake(client, net::kProtocolVersion, 5000);
+    bool handshakeOk = hs.result == HandshakeResult::kWelcome;
+    std::printf("handshake: %s\n", handshakeOk ? "PASS" : "FAIL");
+    if (!handshakeOk) {
+        client.stop();
+        enet_deinitialize();
+        return 1;
+    }
+    uint8_t myPlayerId = hs.welcome.assigned_player_id;
+
+    struct Observed {
+        bool isBot = false;
+        bool haveFirst = false;
+        float firstAltM = 0.0f;
+        float lastAltM = 0.0f;
+    };
+    std::map<uint8_t, Observed> observed;
+    bool anyNan = false;
+
+    auto onEvent = [&](const ENetEvent& event) {
+        if (event.type != ENET_EVENT_TYPE_RECEIVE) return;
+        net::MessageTag tag;
+        if (!net::peekMessageTag(event.packet->data, event.packet->dataLength, tag)) return;
+        if (tag != net::MessageTag::kStateSnapshot) return;
+        net::StateSnapshot snap;
+        if (!net::deserializeStateSnapshot(event.packet->data, event.packet->dataLength, snap)) return;
+        for (const net::AircraftState& a : snap.aircraft) {
+            if (a.player_id == myPlayerId) continue;  // this observer's own aircraft
+            for (float v : a.pos_local_m) {
+                if (!std::isfinite(v)) anyNan = true;
+            }
+            Observed& o = observed[a.player_id];
+            o.isBot = (a.status_flags & net::kStatusFlagBot) != 0;
+            if (!o.haveFirst) {
+                o.firstAltM = a.pos_local_m[1];
+                o.haveFirst = true;
+            }
+            o.lastAltM = a.pos_local_m[1];
+        }
+    };
+
+    auto start = std::chrono::steady_clock::now();
+    auto testDuration = std::chrono::duration<double>(cfg.durationS);
+    while (std::chrono::steady_clock::now() - start < testDuration) {
+        client.poll(20, onEvent);
+    }
+
+    int botCount = 0;
+    bool allEvolving = true;
+    for (const auto& [pid, o] : observed) {
+        if (!o.isBot) continue;
+        ++botCount;
+        // A frozen --stress-aircraft never moves at all (delta exactly
+        // 0.0); any live, flying bot has some nonzero delta over several
+        // seconds of continuous physics integration - a small threshold
+        // robustly distinguishes "moving" from "utterly frozen" without
+        // asserting anything about how fast.
+        float deltaM = std::fabs(o.lastAltM - o.firstAltM);
+        bool evolving = deltaM > 0.01f;
+        std::printf("  bot player_id=%u first_alt_m=%.4f last_alt_m=%.4f "
+                    "delta_m=%.4f evolving=%s\n",
+                    pid, o.firstAltM, o.lastAltM, deltaM,
+                    evolving ? "yes" : "NO");
+        allEvolving = allEvolving && evolving;
+    }
+    bool countOk = cfg.expectBotCount <= 0 || botCount == cfg.expectBotCount;
+    std::printf("observed_bot_count=%d expected=%d\n", botCount, cfg.expectBotCount);
+    std::printf("bot_count_matches: %s\n", countOk ? "PASS" : "FAIL");
+    std::printf("bots_evolving: %s\n", allEvolving ? "PASS" : "FAIL");
+    std::printf("no_nan: %s\n", !anyNan ? "PASS" : "FAIL");
+
+    client.send(net::kChannelReliable, net::serializeClientBye(), true);
+    client.flush();
+    client.disconnect();
+    waitForDisconnect(client, 2000);
+    client.stop();
+    enet_deinitialize();
+
+    return (countOk && allEvolving && !anyNan) ? 0 : 1;
+}
+
 // Increment 5, "Test plan" item 9: assert a StateSnapshot chunk at exactly
 // kMaxAircraftPerChunk aircraft, serialized via the real
 // serializeStateSnapshot(), stays at or under the safe unreliable-send
@@ -1087,8 +1201,8 @@ int runMtuRegressionCheck() {
 // be run against a server started with --stress-aircraft), and live
 // interpcore-based tracking of *other* clients' aircraft. Optionally (
 // --test-capacity) also exercises kServerFull and slot reuse after a
-// disconnect - meaningful only against a server whose --max-clients
-// equals --num-clients.
+// disconnect - meaningful only against a server whose total human
+// capacity (--max-bots + --max-players) equals --num-clients.
 int runMulticlientMode(const Config& cfg) {
     if (enet_initialize() != 0) {
         std::fprintf(stderr, "error: enet_initialize failed\n");
@@ -1103,6 +1217,13 @@ int runMulticlientMode(const Config& cfg) {
         bool haveSelf = false;
         float startAltM = 0.0f;
         float latestAltM = 0.0f;
+        // docs/increment-7-specification.md, "Test plan" item 8: a plain
+        // (non-bot) flight_test_client connection's own aircraft must
+        // never carry the non-human status_flags bit - checked directly
+        // here rather than in a separate scenario, since this mode
+        // already connects real humans alongside whatever bots the
+        // server under test was started with.
+        bool selfMarkedBot = false;
         interp::RemoteEntityTracker tracker;
         std::map<uint8_t, float> lastOtherAltM;
     };
@@ -1211,6 +1332,8 @@ int runMulticlientMode(const Config& cfg) {
                 if (a.player_id == sc.playerId) {
                     sc.haveSelf = true;
                     sc.latestAltM = a.pos_local_m[1];
+                    sc.selfMarkedBot =
+                        sc.selfMarkedBot || (a.status_flags & net::kStatusFlagBot) != 0;
                 } else {
                     sc.tracker.update(a.player_id, a, snap.server_tick, nowS());
                     sc.lastOtherAltM[a.player_id] = a.pos_local_m[1];
@@ -1312,7 +1435,17 @@ int runMulticlientMode(const Config& cfg) {
     }
     std::printf("live_remote_tracking: %s\n", trackingOk ? "PASS" : "FAIL");
 
-    bool overall = distinctIds && crossTalkOk && countOk && trackingOk;
+    // docs/increment-7-specification.md, "Test plan" item 8: none of
+    // these plain (non-bot) connections' own aircraft may carry the
+    // non-human marker - meaningful whenever the server under test was
+    // started with --max-bots > 0, a no-op check otherwise.
+    bool noneMarkedBot = true;
+    for (const auto& c : clients) {
+        if (c->selfMarkedBot) noneMarkedBot = false;
+    }
+    std::printf("humans_not_marked_bot: %s\n", noneMarkedBot ? "PASS" : "FAIL");
+
+    bool overall = distinctIds && crossTalkOk && countOk && trackingOk && noneMarkedBot;
 
     if (cfg.testCapacity) {
         std::string err;
@@ -1387,6 +1520,8 @@ int main(int argc, char** argv) {
         rc = runMtuRegressionCheck();
     } else if (cfg.mode == "aircraft_mismatch") {
         rc = runAircraftMismatchCheck(cfg);
+    } else if (cfg.mode == "observe_bots") {
+        rc = runObserveBotsMode(cfg);
     } else {
         std::fprintf(stderr, "error: unknown --mode '%s'\n", cfg.mode.c_str());
         return 2;
