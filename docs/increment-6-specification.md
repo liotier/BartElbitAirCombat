@@ -88,7 +88,7 @@ No other message changes. Every other participant's serialization code is unaffe
 
 ## Documentation
 
-`README.md`'s server-usage sections gain `--aircraft`/`--aircraft` mentions alongside the existing `--max-clients`/`--server` documentation. `docs/roadmap.md` entry 6 already reflects this increment's scope and findings.
+`README.md`'s server-usage sections gain the server's `--aircraft` flag, `start_client.sh`'s matching `--aircraft` flag, and the `AIRCRAFT` environment override, alongside the existing `--max-clients`/`--server` documentation. `docs/roadmap.md` entry 6 already reflects this increment's scope and findings.
 
 ## Licence
 
