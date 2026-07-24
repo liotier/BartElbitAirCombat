@@ -2,131 +2,150 @@
 
 ## Status
 
-Revision 2. Pre-drafting validation (process/lifecycle) plus adversarial review (`docs/increment-7-specification-review.md`, findings B1/M1/M2/m1/m2/m3) folded in. **One open decision remains for the project owner before implementation** — whether the bot stays physics-less (the design written below) or gains a real local `FlightSession` (see "Open questions", finding B1's fork). Not yet implemented.
+Revision 3. Pre-drafting validation (process/lifecycle) plus adversarial review (`docs/increment-7-specification-review.md`) folded in, then the review's one open architecture decision resolved by the project owner: **bots run their own local JSBSim** (a true headless client, not a physics-less one — see "The local-physics decision" below). Revision 3 also folds in the owner's capacity/load model and the non-human marking and remote-bot direction. Not yet implemented.
 
 ## Goal
 
-A simple, headless **control-and-perception** client (`flight_bot`) — it sends `ControlInput` and receives the full snapshot picture, exactly the I/O of a human client, but (in the design written here) without the human client's local prediction — that populates the airspace around a server's spawn point with gently maneuvering aircraft. Useful both for a server configured with a target bot count and for automated testing, architected as a genuine network client rather than an in-process server-side shortcut so the "full airspace picture" perception plumbing future combat intelligence will need already exists rather than being retrofitted later. (It is deliberately *not* called a "headless human client": the human client's defining feature is client-side prediction/reconciliation, which the physics-less design omits — so as a test client it exercises the server's multi-client path but not the prediction path, review finding M2.)
+`flight_bot`: a genuinely headless version of the networked client — it runs the *same* local `FlightSession` + `PredictedSession` a human's Godot client runs (just without Godot, rendering, or input), sends `ControlInput`, and receives the full snapshot picture. It populates the airspace around a server's spawn point with gently maneuvering aircraft, and is a genuine network client rather than an in-process server-side shortcut, so both the "full airspace picture" perception and the local flight-dynamics model that future combat intelligence needs are present from the start rather than retrofitted.
+
+### The local-physics decision (resolves review finding B1's fork)
+
+The adversarial review measured that a *physics-less* bot cannot keep aircraft airborne: it can't self-determine its airframe's trim (which the server overwrites every tick) and can only read its own state through a 100 ms-delayed interpolating tracker, so it departs within a maneuver cycle (Appendix B). The owner resolved the review's fork toward **giving the bot a real local `FlightSession`**, for a reason beyond just fixing that: the later air-combat increment will "bestow some air-combat smarts unto the bot," and those smarts require the bot to apply its own aircraft's flight-dynamics model to optimise energy (deliberately fuzzed by a per-bot handicap factor). A bot with no physics could never do that. Local physics is therefore load-bearing for the project's direction, not merely the cheaper way to keep this increment's bots airborne — so it is adopted now.
+
+Consequences, all positive for this increment:
+- The bot knows its own trim exactly, from its own trim solve — **no server-seeded trim, and therefore no wire-layout change and no protocol-version bump** (revision 2 needed both; revision 3 does not).
+- The bot flies its controller closed-loop against its own **zero-latency, full-rate local state**, not a delayed interpolated snapshot — the review's feedback-latency problem disappears.
+- It is a true headless *human* client, so it exercises the full client-side prediction/reconciliation path — retiring the review's finding M2 (the bot is now a genuine test client for that path, not only for the server's multi-client handling).
 
 ## Non-goals
 
-- **Any actual combat intelligence or decision-making about other aircraft.** Bots fly a fixed, simple maneuver pattern, oblivious to other players — even though they *do* receive full snapshot data about them (see Goal).
-- **Difficulty levels, skill tuning, or bot "personalities."**
+- **Any actual combat intelligence or decision-making about other aircraft.** Bots fly a fixed, simple maneuver pattern, oblivious to other players — even though they receive full snapshot data about them, and now carry the local physics model a future increment's energy-management AI will use.
+- **Difficulty levels, skill tuning, or bot "personalities"** (including the eventual per-bot handicap factor — named as the *reason* for local physics, but not implemented here).
+- **Remote / third-party bot hosting and any "bot-programmer competition" scene** — a genuinely valuable future direction (see "Remote bots"), but deferred to its own increment; this increment builds *local* bots only, with the marking and client architecture deliberately designed so remote bots slot in later with no rework.
 - **Multiple aircraft types per bot roster** — a bot flies whichever single type increment 6's server is configured for, same as any human client that session.
 - **Persistent bot identity across server restarts.**
-- **Any change to human-client behaviour or protocol** beyond the `PlayerLeft`-driven despawn path that already exists (increment 5).
 
 ## Architecture
 
-### `flight_bot`: a genuinely headless client
+### `flight_bot`: a headless client with local physics
 
-New standalone binary, `src/bot/main.cpp` (mirroring `src/server/`'s own directory convention), Godot-free, depending only on `netcore` and `interpcore` — critically, **not** `flightcore`/JSBSim. A bot never runs its own local physics; it trusts the server's own last-broadcast `StateSnapshot` entry for its own player_id as "where am I now." Nobody is judging a bot's own responsiveness the way a human judges feel, so there is no reason to predict locally — an ordinary amount of network latency in a bot reacting to its own state is entirely fine.
+New standalone binary, `src/bot/main.cpp`, Godot-free, depending on `flightcore` (its own `FlightSession`), `predictcore` (`PredictedSession` — predict/reconcile, reused unmodified from the Godot client), `netcore`, and `interpcore`. On startup it loads and trims the server's configured aircraft type (from `ServerWelcome.aircraft_id`, increment 6) exactly as `PredictedAircraft` does, then runs the identical predict/send/reconcile loop — the bot *is* increment 4/5's client, headless.
 
-Connects exactly like any real client: `ClientHello` → `ServerWelcome` (reads `assigned_player_id`, `aircraft_id`, **and its seeded trim vector** — see Wire protocol changes) → a `ControlInput` loop → `StateSnapshot` handling. On receiving a chunk, every *other* aircraft's entry is fed into an `interp::RemoteEntityTracker` — the "full airspace picture" the Goal calls for, exactly as `PredictedAircraft` does, unused by decision logic today but exercised end-to-end for future combat intelligence. The bot's **own** entry is read directly from the latest raw `AircraftState`, **not** through the tracker: the tracker deliberately renders ~100 ms in the past (`kInterpolationDelayS`) and extrapolates, which is right for smoothing others for display but wrong as feedback for a control loop, which wants the freshest real datum (review finding B1).
+Connects like any client: `ClientHello` → `ServerWelcome` (reads `assigned_player_id`, `aircraft_id`) → a `ControlInput` loop → `StateSnapshot` handling. Every *other* aircraft's snapshot entry feeds an `interp::RemoteEntityTracker` (the "full airspace picture", unused by decision logic today, ready for future combat AI). The bot's **own** control loop reads its own **local predicted state** (zero latency, full rate) — the whole point of local physics — not a received snapshot and not the interpolating tracker.
 
 ### Maneuver logic
 
-Keeping an aircraft in gentle maneuvers is a **closed-loop attitude-control** problem, not an open-loop schedule of control deflections — this was measured, not assumed (review finding B1, Appendix B): aileron commands roll *rate*, so a fixed "hold aileron for the turn" deflection integrates bank without bound and spirals, and a trim-blind bot that sends zero aileron/rudder loses the airframe's non-zero roll/yaw trim and departs within one maneuver cycle. So:
+Keeping an aircraft in gentle maneuvers is a closed-loop attitude-control problem, not an open-loop deflection schedule — measured, not assumed (review finding B1, Appendix B): aileron commands roll *rate*, so sustained deflection integrates bank without bound. With local physics the controller has the best possible inputs (exact trim, zero-latency attitude and body rates), but it is still a small autopilot with feedback, not a time-based deflection script:
 
-- The pattern is a schedule of **attitude targets**, not control deflections: target a shallow bank (e.g. ~15°) for the turn phase and wings-level otherwise; target a gentle climb/descent pitch for the climb/descend phases; level between. `T1`/`T2`/`T3` phase durations are as before.
-- Each tick, the bot runs a small **stabilised controller** toward the current phase's target — proportional on attitude error, derivative (body-rate) damping to stop the roll/pitch integrating into a departure, and rudder–aileron turn coordination — reading its own current attitude and body rates from the latest raw snapshot (above). This is the load-bearing part, not an optional "soft bias": without the rate damping and coordination, the aircraft departs (measured).
-- The controller commands are expressed **relative to the seeded trim vector** (aileron = trim_aileron + control_output, etc.): the server supplies the trim baseline the physics-less bot cannot compute, and the bot perturbs around it. Elevator is the exception — the trim's pitch solution lives in `pitch-trim-cmd-norm`, which the server never overwrites, so elevator commands around zero are already around trim.
+- The pattern is a schedule of **attitude targets** — a shallow bank (≈15°) for the turn phase, wings-level otherwise; a gentle climb/descent pitch for those phases; level between. `T1`/`T2`/`T3` phase durations as before.
+- Each tick the controller drives toward the current phase's target: proportional on attitude error, derivative (body-rate) damping to stop roll/pitch integrating into a departure, rudder–aileron turn coordination — all reading the bot's own local state.
+- Commands are expressed relative to the bot's own trimmed control values (which it knows locally); elevator perturbs around the trim's `pitch-trim-cmd-norm` baseline.
 
-This is a small autopilot, deliberately simple, but it *is* an autopilot with feedback — the empirical finding is that nothing less keeps the aircraft up. Its gains are airframe-sensitive; see the endurance gate (Test plan) and the Camel caveat (Out of scope).
+Gains are airframe-sensitive; see the endurance gate (Test plan) and the Camel caveat (Out of scope).
 
-### Server-side spawn, capacity, and refill policy
+### Server-side capacity, spawn, and CPU-leveling
 
-`flight_server` gains `--bots N` (target count, default 0). Unlike `--stress-aircraft` (increment 5 — deliberately outside `--max-clients` capacity accounting, frozen/trimmed, never maneuvers, exists purely for chunking-load testing), bots share the *same* player_id/capacity pool as real clients: the whole point is that a bot occupies a slot a human could otherwise take, and gets displaced the moment one does.
+`flight_server` gains two caps:
+- `--max-bots B`: bots that fill the airspace when the server is otherwise empty.
+- `--max-players P`: humans admitted "on top of" the bots before bots begin yielding slots.
 
-The server drives toward `bots_active = max(0, N - humans_connected)`, re-evaluated and corrected on each *actual* ENet connect/disconnect event — an eventually-consistent target it converges to, **not** an invariant held every instant (review finding m2): spawn and despawn are both asynchronous (fork + connect + increment-5 async onboard on one side, `SIGTERM` + disconnect on the other), each spanning many ticks, so instantaneous maintenance is neither possible nor needed. A mid-flight refill bot counts toward the target the moment it is `fork()`ed (not only once welcomed), so a burst of connects cannot over-spawn.
+Policy (the owner's load model): the airspace fills to **B** bots when empty. As humans connect, up to **P** of them are admitted on top of the bots — the airspace grows from B toward **B + P** — and each human beyond P is still admitted, now by **displacing one bot** (the airspace holds at B + P, its composition shifting from bot to human), until at B + P humans it is all-human with no bots. Total aircraft never exceeds **B + P**, and a human is never turned away in favour of a bot.
 
-- If a human connect would exceed `--max-clients` and at least one bot currently occupies a slot, the server despawns one bot to make room. **Sequencing matters and is specified explicitly (review finding M1):** a bot's player_id is freed by increment 5's existing path when its ENet `DISCONNECT` event is processed, which arrives some round-trips *after* the `SIGTERM`, not synchronously with it. So the server initiates the bot's `SIGTERM` (and its `PlayerLeft` broadcast) and completes the displacing human's player_id allocation only *once the freed slot is actually observed* — the human's onboarding is sequenced behind the bot's real disconnect, not merely behind the signal. A human is never rejected purely because bots occupy slots meant for them, and never double-allocated a slot the bot hasn't yet vacated.
-- If a human disconnects and `bots_active + humans_connected < N`, the server spawns a new bot to refill back toward N (per explicit decision: refill, not "stay down until restart").
+**Why this shape, and why the two caps are separate — CPU-leveling.** A *local* bot now runs its own JSBSim (the decision above) as a forked child *on the server host*, so it costs the server host **two** JSBSim instances: its own local-prediction copy plus the server's authoritative copy. A human costs the server host **one** — only the authoritative copy, since the human's prediction runs on their own machine. Because a displaced local bot frees two instances while the arriving human costs one, the server's JSBSim load **peaks at the B-bots-plus-P-humans transition** (2B + P instances) and then *eases* as further humans displace bots (each displacement nets −1). The busiest-by-headcount server is deliberately not the highest-CPU one, and a box provisioned for 2B + P never overloads however the bot/human mix shifts — this is exactly the "levels the CPU requirements across the scaling" the model is designed for. (Ratio note: the owner's stated rule is one human displaces one bot; a stricter budget-preserving variant — two humans per bot, holding 2·bots + humans constant — is possible if a flat CPU profile is ever wanted over the eased one. One human per bot is specified here.)
 
-At startup, `--bots N` spawns bots within the existing `--max-clients` bound (so N is already capped at a modest number); if a future large fleet is ever wanted, spawns should be paced across a few ticks rather than issued all at once, to avoid an unpaced fork+connect+trim burst (review finding m3) — not load-bearing at the intended scale, noted for the bound.
+The count is driven toward this target on each *actual* ENet connect/disconnect event — eventually-consistent, not an instantaneous invariant (review finding m2): spawn (fork + connect + increment-5 async onboard) and despawn (`SIGTERM` + disconnect) each span many ticks. A mid-flight refill bot counts toward the target the moment it is `fork()`ed, so a connect burst cannot over-spawn.
 
-"Despawn a bot" means sending that bot's own process `SIGTERM` and removing it from the server's child-process tracking table — validated directly (Appendix B): `flight_bot` handles `SIGTERM` as a clean disconnect, so the OS signal *is* the despawn mechanism, no new server→client wire message needed for it.
+**Displacement sequencing is specified explicitly (review finding M1):** a bot's player_id is freed by increment 5's existing path when its ENet `DISCONNECT` is processed — some round-trips *after* the `SIGTERM`, not synchronously. So the server initiates the bot's `SIGTERM` (and its `PlayerLeft` broadcast) and completes the displacing human's player_id allocation only once the freed slot is actually observed — the human's onboarding is sequenced behind the bot's real disconnect, never merely behind the signal, so a slot is never double-allocated.
 
-**Crash safety (review finding m1)**: Appendix B validated *clean* shutdown only, but a `flight_server` crash (`SIGKILL`, segfault) does not run the reap path, and POSIX does not kill children with their parent — orphaned bots would keep running against a dead port. So `flight_bot` **exits on loss of its server connection** (ENet disconnect/timeout), which also cleanly handles the "server restarted" case; on Linux the implementer may additionally set `prctl(PR_SET_PDEATHSIG, SIGTERM)` in the child after `fork()` for defence in depth. "No orphaned processes" must hold under crash, not only under clean exit.
+**Spawn/despawn mechanism.** "Despawn a bot" is `SIGTERM` to its process plus removal from the child-tracking table; `flight_bot` handles `SIGTERM` as a clean disconnect (validated, Appendix B), so the OS signal *is* the despawn mechanism. **Crash safety (review finding m1):** Appendix B validated clean shutdown only, but a `flight_server` crash (`SIGKILL`, segfault) does not run the reap path and POSIX does not kill children with their parent — so `flight_bot` also **exits on loss of its server connection** (ENet disconnect/timeout), which additionally handles the "server restarted" case; on Linux the implementer may set `prctl(PR_SET_PDEATHSIG, SIGTERM)` after `fork()` for defence in depth.
 
-`flight_server`'s existing multi-client connection-acceptance path needs zero special-casing to accept a bot — a bot is a real ENet connection over localhost UDP to the server's own listening port, going through the identical `ClientHello`/player_id-allocation/onboarding pipeline every human client already uses (validated directly, Appendix B). The only new server-side code is: the count-maintenance policy above, and the `fork()`/`exec()`/track-pid/`waitpid`-on-exit bookkeeping.
+`--max-bots` bots are spawned at startup within the load budget; a large fleet should be spawned paced across a few ticks rather than all at once (review finding m3) — not load-bearing at the intended scale, noted for the bound.
+
+### Marking bots as non-human
+
+Bots — local now, remote later — must be **clearly marked as non-human** so a client can render and label them distinctly (owner's requirement). This uses one bit of `AircraftState.status_flags`, the `uint8` increment 5 already reserved for exactly this kind of use — so it is a *defined bit, not a new field*, and therefore **not a wire-layout change** (an old client simply ignores the bit; `kProtocolVersion` stays at increment 6's value of 2). The server knows which aircraft are bots because it forked them, and sets the bit when building their `AircraftState`. The Godot client's `RemoteAircraftSpawner` reads it and gives bot aircraft a visually distinct marker from human players.
+
+### Remote bots (forward-looking; hosting deferred)
+
+Because a bot is already a genuine network client, a **remote, third-party bot** — someone else's program, connecting from their own machine to compete in the airspace (the "bot-programmer scene" the owner envisions) — is architecturally just a client that connects and declares itself a bot. Two things make this increment forward-compatible with it, without building it:
+- The non-human `status_flags` bit is defined uniformly, so a remote bot is marked exactly like a local one ("remote bots should be like local bots: clearly marked as non-humans").
+- A remote bot self-declares via a future one-bit flag in `ClientHello` (the server can't fork it, so it can't otherwise know) — deferred with the rest of remote-bot hosting, and noted here so the field is added deliberately when that increment lands.
+
+A remote bot's local physics runs on *its* machine, so it costs the server host one JSBSim instance (like a human), not two — a detail the CPU-leveling model will revisit when remote bots are actually scheduled. The hosting, the self-declaration flag, any competition/scoring framework, and any sandboxing of third-party bot code are all **out of scope here**, deferred to their own increment.
 
 ## Wire protocol changes
 
-**One addition** (revised from draft 1's "none" — review finding B1). A physics-less bot cannot compute its own airframe's non-zero trimmed control values (aileron, rudder, throttle), which differ per airframe and which the server overwrites every tick; the server *has* them (it trims every aircraft), so it must seed them to the bot. Carried on **`ServerWelcome`**, extended with three trim floats (`trim_aileron`, `trim_rudder`, `trim_throttle`) alongside the `aircraft_id` increment 6 already adds — or, if preferred, a small dedicated `TrimBaseline` message sent immediately after welcome. Either way this is a wire-layout change, so per increment 6's standing rule **`kProtocolVersion` bumps again, to 3.**
+**No wire-layout change; no protocol-version bump.** The local-physics decision removed revision 2's server-seeded-trim field, and the non-human marker is a *defined bit* of the already-present, already-reserved `AircraftState.status_flags` `uint8` — not a new field. `kProtocolVersion` stays 2 (increment 6's value). The bot's own outbound traffic (`ClientHello`, `ControlInput`) and `StateSnapshot`/`PlayerLeft` handling are byte-identical to a human client's. (The future remote-bot `ClientHello` self-declaration bit, when added, *will* be a layout change and bump the version then — not now.)
 
-The bot's *own outbound* traffic is still byte-identical to a human client's — `ClientHello`, `ControlInput`, and its handling of `StateSnapshot`/`PlayerLeft` are unchanged; only the server→client welcome grows a field that human clients simply ignore. (A human client already knows its own trim from its local `FlightSession`, so the seeded values are redundant for it and harmless.)
+## Test plan
 
-1. **Airborne-endurance gate (the acceptance test that actually matters, review finding B1)** — the bot's controller, run headless against a real server-side `FlightSession` for each airframe in the bot fleet, keeps the aircraft airborne (no ground contact, no spiral past a bank limit, no stall) for **≥ 3 minutes** of continuous unsupervised maneuvering. This is developed and run *before* the network path and *before* any human "looks sane" check, so controller tuning is not entangled with ENet timing. c172x and pa28 are confirmed tractable with a stabilised controller (Appendix B); the Camel is gated on this test, not assumed (see Out of scope).
-2. `flight_server --bots N`, no humans connected: confirm N bot player_ids appear in a connected `flight_test_client`'s view within a few ticks of startup, each with genuinely evolving (non-frozen) altitude/attitude that stays *bounded and airborne* over time — not merely non-frozen (an aircraft spiralling into the ground is also "non-frozen"), the real distinction from a `--stress-aircraft` synthetic.
-3. `flight_server --bots 2 --max-clients 3`, then connect 2 real (simulated) clients: confirm bots are displaced (`PlayerLeft` fires for each) as humans take their slots, that the displacing human's slot is allocated only after the bot's disconnect is actually processed (finding M1), and that a third real client can still connect — total capacity respected, not blocked by lingering bots.
-4. Disconnect a human client; confirm a bot respawns to refill back toward N within a few ticks.
-5. Child-process lifecycle, clean: `flight_server` `SIGTERM` terminates every bot child it spawned — no orphans after a clean exit (validated in Appendix B's pre-drafting probe).
-6. Child-process lifecycle, **crash** (finding m1): `SIGKILL` the `flight_server` and confirm its bots exit on their own (server-connection loss), leaving no orphaned processes — the case clean shutdown doesn't cover.
-7. A bot's own `RemoteEntityTracker` genuinely receives *other* aircraft's snapshot data, not just its own — confirmed by starting 2 bots and checking (via a debug/self-test path in `flight_bot`, or an external observer) that each is aware of the other, even though neither acts on it.
-8. Full `scripts/run_tests.sh` passes end-to-end across increments 1-7.
+1. **Airborne-endurance gate (the acceptance test that matters, review finding B1)** — the bot, running its real local `FlightSession` + controller, keeps its aircraft airborne (no ground contact, spiral, or stall) for **≥ 3 minutes** of continuous unsupervised maneuvering, per airframe in the bot fleet. Developed and passed *before* the human "looks sane" check. c172x and pa28 are tractable with a stabilised controller (Appendix B); the Camel is gated on this test, not assumed (Out of scope).
+2. `flight_server --max-bots N`, no humans: N bot player_ids appear in a connected `flight_test_client`'s view within a few ticks, each **marked non-human** (status_flags bit) and with genuinely evolving *and bounded/airborne* altitude/attitude — the real distinction from a frozen `--stress-aircraft`.
+3. Capacity/CPU-leveling model: with `--max-bots B --max-players P`, connect humans past P and confirm (a) the first P humans add on top of the bots (airspace grows toward B+P), (b) humans beyond P each displace one bot (airspace holds at B+P), (c) the displacing human's slot is allocated only after the bot's disconnect is processed (finding M1), and (d) a human is never rejected while a bot occupies a slot.
+4. Disconnect a human below the P threshold; confirm a bot refills back toward B.
+5. Child-process lifecycle, clean: `SIGTERM` to `flight_server` terminates every bot child, no orphans (Appendix B).
+6. Child-process lifecycle, **crash** (finding m1): `SIGKILL` the server and confirm its bots exit on their own (connection loss), no orphans.
+7. A bot's `RemoteEntityTracker` receives *other* aircraft's snapshot data, not just its own (start 2 bots; each is aware of the other) — the perception path for future combat AI.
+8. The non-human `status_flags` bit is set on bot aircraft and clear on human/`flight_test_client` aircraft, end to end.
+9. Full `scripts/run_tests.sh` passes end-to-end across increments 1-7.
 
 ## Documentation
 
-`README.md` gains a `--bots` usage example alongside the existing `--max-clients`/`--stress-aircraft` documentation.
+`README.md` gains `--max-bots`/`--max-players` usage and a note that bot aircraft are marked and rendered distinctly from humans, alongside the existing `--max-clients`/`--stress-aircraft` documentation. (`--max-clients` from increment 5 is subsumed by `--max-players`; the relationship is spelled out in the README.)
 
 ## Licence
 
-No change. `flight_bot` is new source in this repository under the same GPL-3.0-or-later as everything else; no new third-party dependency (reuses `netcore`/`interpcore`, already-fetched ENet transitively).
+No change. `flight_bot` is new source under the same GPL-3.0-or-later; it links the same `flightcore`/`predictcore`/`netcore`/`interpcore` already in the tree — no new third-party dependency.
 
 ## Acceptance criteria
 
-1. **Every airframe in the bot fleet passes the airborne-endurance gate** (test plan item 1): ≥ 3 minutes continuous unsupervised maneuvering with no ground contact, spiral, or stall. This is the criterion the increment lives or dies by; the rest assume it.
-2. `flight_bot` connects to a real `flight_server` exactly like any human client, with no server-side special-casing beyond the seeded trim vector (connection path validated in Appendix B).
-3. `flight_server --bots N` spawns up to N bots at startup, sharing the same player_id/capacity pool as real clients (unlike `--stress-aircraft`).
-4. A human connect displaces a bot the moment a slot is needed — with the human's slot allocated only after the displaced bot's disconnect is actually processed (finding M1) — and a human disconnect refills a bot back toward N.
-5. Every spawned bot is cleanly terminated with no zombies when despawned or on clean server shutdown (`SIGTERM`/`waitpid`), **and leaves no orphan when the server crashes** (bot exits on connection loss, finding m1).
-6. Bots fly a genuinely evolving *and bounded/airborne* pattern (climb/shallow-turn/descend/level) — distinct from both a frozen `--stress-aircraft` synthetic and from an aircraft "evolving" into a spiral.
-7. Bots receive full snapshot data for every other aircraft, not just their own, even though nothing acts on it yet.
-8. `kProtocolVersion` is 3, reflecting the seeded-trim wire change.
-9. The full `scripts/run_tests.sh` suite passes end-to-end across increments 1-7.
-10. *(pending human verification, matching increment 4/5/6's own equivalent criteria)* A human confirms bots visibly populate the airspace and look reasonably sane in flight — now backed by the automated endurance gate, so a human is never asked to judge an aircraft that is quietly departing.
+1. **Every airframe in the bot fleet passes the airborne-endurance gate** (≥ 3 min, no ground contact/spiral/stall) — the criterion the increment lives or dies by.
+2. `flight_bot` runs a real local `FlightSession` + `PredictedSession` (a true headless client), connecting exactly like a human client with no server-side special-casing beyond the fork/track bookkeeping.
+3. `flight_server --max-bots B --max-players P` implements the capacity/CPU-leveling model: bots fill to B when empty; humans add on top up to P then displace bots; total never exceeds B + P; a human is never rejected for a bot.
+4. A human connect displaces a bot only once past the additive threshold, with the human's slot allocated after the displaced bot's disconnect is processed (finding M1); a human disconnect refills a bot.
+5. Every spawned bot is cleanly terminated with no zombies when despawned or on clean server shutdown, **and leaves no orphan when the server crashes** (bot exits on connection loss, finding m1).
+6. Bot aircraft carry the non-human `status_flags` bit end to end; human aircraft do not; the Godot client renders bots distinctly.
+7. Bots fly a genuinely evolving *and bounded/airborne* pattern — distinct from both a frozen `--stress-aircraft` and from an aircraft "evolving" into a spiral.
+8. Bots receive full snapshot data for every other aircraft (the future-combat-AI perception path), even though nothing acts on it yet.
+9. `kProtocolVersion` is unchanged at 2 (no wire-layout change this increment).
+10. The full `scripts/run_tests.sh` suite passes end-to-end across increments 1-7.
+11. *(pending human verification)* A human confirms bots visibly populate the airspace, are clearly distinguishable from human players, and look reasonably sane in flight — backed by the automated endurance gate, so no human is asked to judge an aircraft that is quietly departing.
 
 ## Out of scope, explicitly deferred
 
-Everything in increments 1-6's deferred lists, plus: combat intelligence/decision-making (a later increment, once real combat exists to react to), difficulty/personality tuning, persistent bot identity across restarts, multiple aircraft types per bot roster (increment 8's concern, applied uniformly here).
+Everything in increments 1-6's deferred lists, plus: combat intelligence / energy-management AI and the per-bot handicap factor (a later increment — local physics is built now *for* it, but no smarts here); remote/third-party bot hosting, the bot-programmer competition scene, the `ClientHello` self-declaration flag, and any third-party-code sandboxing (their own future increment); difficulty/personality tuning; persistent bot identity across restarts; multiple aircraft types per bot roster (increment 8).
 
-**The Camel in the bot fleet is gated, not assumed** (review finding B1): a stabilised controller flew c172x and pa28 solidly but still spiralled the Camel in testing (Appendix B) — a low-power, low-speed, spiral-prone WWI biplane trimmed near its own energy margin is a materially harder control target. If a conservatively-tuned controller cannot pass the endurance gate for the Camel, the first bot implementation ships with the GA airframes only (c172x, pa28) and the Camel is deferred from the *bot* fleet — the same "shelve the hard airframe, revisit post-demo" discipline increment 6 applied to p51d/dr1/L17. (The Camel remains a fully valid *human*-flown airframe; this is only about whether the simple bot autopilot can fly it unsupervised.)
+**The Camel in the bot fleet is gated, not assumed** (review finding B1): a stabilised controller flew c172x and pa28 solidly but still spiralled the Camel in testing (Appendix B) — a low-power, low-speed, spiral-prone WWI biplane trimmed near its own energy margin is a materially harder control target. Local physics gives the controller its best possible inputs (exact trim, zero-latency state), which may be enough where the physics-less version was not; but if a conservatively-tuned controller still cannot pass the endurance gate for the Camel, the first bot implementation ships with the GA airframes only (c172x, pa28) and the Camel is deferred from the *bot* fleet — the "shelve the hard airframe, revisit post-demo" discipline increment 6 applied to p51d/dr1/L17. The Camel remains a fully valid *human*-flown airframe; this is only about the simple bot autopilot flying it unsupervised.
 
-- **PRIMARY — physics-less bot vs. bot with a real local `FlightSession` (owner's decision, review finding B1's fork).** The spec above is written for a **physics-less** bot, which requires: server-seeded trim (a wire change + version bump), a closed-loop controller reading raw own-state snapshots, and per-airframe controller tuning that (measured) does not yet fly the Camel. Giving the bot **a real local `FlightSession`** — a true headless human client running its own `PredictedSession` like the Godot client — *dissolves* all of that: it would know its own trim (no seeding, no wire change, no version bump), fly closed-loop against zero-latency local state (the Camel's delayed-feedback problem largely goes away), and exercise the full prediction/reconciliation path as a genuine test client (retiring finding M2). The cost is a per-bot trim (~12 ms) on spawn plus local physics stepping — the server already steps that aircraft, so it is stepped twice — against the "populate the airspace cheaply" goal. **This choice changes what gets built and should be made before implementation starts.** Recommendation deferred to the owner; the review record lays out both arms.
-- Exact `T1`/`T2`/`T3` durations, target bank/pitch magnitudes, and controller gains — a feel/tuning question settled against the endurance gate (test plan item 1), not an architecture one. Reasonable small values (≈15° bank, a few hundred feet of altitude change) then tuned until the gate passes for each fleet airframe.
-- Whether `flight_server` should log bot spawn/despawn events distinctly from human connect/disconnect, for operator visibility — a small, low-risk addition, not load-bearing for any acceptance criterion.
+## Open questions for the implementer
+
+- Exact `T1`/`T2`/`T3` durations, target bank/pitch magnitudes, and controller gains — a feel/tuning question settled against the endurance gate, not architecture. Reasonable small values (≈15° bank, a few hundred feet) then tuned until the gate passes for each fleet airframe.
+- Whether the "double JSBSim on the server host per local bot" cost (2B instances at full bot load) wants a lower default `--max-bots` than a human-only server's `--max-clients` would suggest — a provisioning default, informed by increment 5's per-aircraft step-cost measurements, not a correctness question.
+- Whether `flight_server` logs bot spawn/despawn distinctly from human connect/disconnect, for operator visibility — small, low-risk, not load-bearing for any acceptance criterion.
 
 ## Appendix A: message and field reference (normative, updates to increment 6's)
 
-**`ServerWelcome`** gains three trailing trim floats (revised from draft 1's "no changes", review finding B1):
+**No layout changes.** One previously-reserved bit of `AircraftState.status_flags` (`uint8`, present since increment 5) is now defined:
 
-| Field | Wire type | Notes |
-|---|---|---|
-| ...all increment-6 fields... | | unchanged, including `aircraft_id` |
-| `trim_aileron` | `float32` | the server's trimmed `fcs/aileron-cmd-norm` for this aircraft |
-| `trim_rudder` | `float32` | trimmed `fcs/rudder-cmd-norm` |
-| `trim_throttle` | `float32` | trimmed `fcs/throttle-cmd-norm` |
+| status_flags bit | meaning |
+|---|---|
+| bit 0 (`0x01`) | aircraft is bot-controlled (non-human); set by the server for bots, clear for humans |
 
-(Elevator is intentionally absent: the trim's pitch solution lives in `pitch-trim-cmd-norm`, which the server never overwrites, so the bot's elevator commands around zero are already around trim.) A human client ignores these fields — it knows its own trim from its local `FlightSession`. If a dedicated `TrimBaseline` message is preferred over extending `ServerWelcome`, it carries the same three floats plus the target `player_id`. Either way `kProtocolVersion` becomes **3**.
-
-`ClientHello`, `ControlInput`, `StateSnapshot`, `ServerReject`, `PlayerLeft` — unchanged in layout. The bot's own outbound traffic is byte-identical to a human client's.
+All messages keep their increment-6 layout; `kProtocolVersion` stays 2. (Reserved for a future increment, not added here: a `ClientHello` self-declaration bit for remote bots, which *will* be a layout change and bump the version at that time.)
 
 ## Appendix B: measured findings from pre-drafting validation (informative)
 
-**Child-process spawn and lifecycle, validated directly** (`probe_bot_parent.cpp`/`probe_bot_child.cpp` — a real `flight_server`, a parent process that `fork()`/`exec()`s a minimal stand-in client, no code shared with or borrowed from the eventual `flight_bot` beyond reusing `netcore`'s own `NetClient`):
+**Child-process spawn and lifecycle, validated directly** (`probe_bot_parent.cpp`/`probe_bot_child.cpp` — a real `flight_server`, a parent that `fork()`/`exec()`s a minimal stand-in client):
 
-- The forked child successfully connected to a real, already-running `flight_server` over real ENet/UDP, received `ServerWelcome`, and was assigned `player_id=1` — no server-side special-casing needed; the server's existing multi-client onboarding path handled it exactly like any other connection.
-- The parent's `kill(pid, 0)` liveness check confirmed the child was genuinely alive and running before signalling it.
-- `SIGTERM` sent from the parent was caught by the child and produced a clean, orderly disconnect — the same signal-handling shape `flight_server` itself already uses (`volatile std::sig_atomic_t` flag, checked in the main loop, `src/server/main.cpp`), confirming this pattern is safe to reuse for bot lifecycle management.
-- `waitpid()` reaped the child with exit code 0. A second `kill(pid, 0)` after reaping correctly returned `ESRCH` ("No such process") — confirming no zombie process was left behind.
-- The server itself (`flight_server`, a real process throughout, not a probe stand-in) remained healthy and running throughout the entire connect/disconnect cycle, confirmed via its own log and an explicit status check afterward — no crash, no hang, no leaked state.
+- The forked child connected to a real running `flight_server` over real ENet/UDP, received `ServerWelcome`, and was assigned `player_id=1` — no server-side special-casing; the existing multi-client onboarding path handled it like any connection.
+- `kill(pid, 0)` confirmed liveness before signalling. `SIGTERM` produced a clean, orderly disconnect (the same `volatile std::sig_atomic_t` pattern `flight_server` itself uses). `waitpid()` reaped it with exit 0; a second `kill(pid, 0)` returned `ESRCH` — no zombie.
+- The server stayed healthy throughout the connect/disconnect cycle (log + explicit status check) — no crash, hang, or leaked state.
 
-This directly grounds the "zero server-side special-casing" and "no zombie processes" claims in the Architecture section and acceptance criteria above, rather than assuming standard POSIX process-lifecycle behaviour would simply work. (It validated *clean* shutdown; the *crash*-orphan case is finding m1, handled by the bot exiting on connection loss.)
+This grounds the "zero server-side special-casing" and "no zombie" claims. It validated *clean* shutdown; the *crash*-orphan case is finding m1, handled by the bot exiting on connection loss.
 
-### Review measurements — bot flight behaviour (added during adversarial review; `probe_inc7_bot{,2,3}.cpp`)
+### Review measurements — bot flight behaviour (`probe_inc7_bot{,2,3}.cpp`)
 
-Three probes replicated the server's exact per-tick command application (`applyClientCommand`: set elevator/aileron/rudder/throttle-cmd-norm from the client command each tick, leaving the trim's `pitch-trim-cmd-norm` untouched) and drove a real `FlightSession` for each of the three increment-6 airframes for 90 s (three maneuver cycles), flagging departure (NaN / ground contact / spiral > 80° / stall < 20 kt). These reshaped the maneuver design from "simple time-based schedule" into a stabilised closed-loop controller (finding B1):
+Three probes replicated the server's exact per-tick command application (set elevator/aileron/rudder/throttle-cmd-norm from the client command each tick, leaving the trim's `pitch-trim-cmd-norm` untouched) and drove a real `FlightSession` per airframe for 90 s, flagging departure (NaN / ground / spiral > 80° / stall < 20 kt). These are what established that a bot must (a) know its own trim and (b) fly a stabilised closed-loop controller — i.e. what motivated the local-physics decision, which gives the bot both directly:
 
 | control style | c172x | Camel | pa28 |
 |---|---|---|---|
@@ -138,6 +157,6 @@ Three probes replicated the server's exact per-tick command application (`applyC
 
 Reading:
 
-- **Trim-blindness departs every airframe.** JSBSim's trim writes non-zero solutions into `aileron-cmd-norm`/`rudder-cmd-norm` (c172x −0.075/−0.004; Camel +0.102/−0.064; each different) and a different throttle each (c172x 0.792, Camel 0.301). A physics-less bot sending zero aileron/rudder and a guessed throttle discards them and departs. → the server must seed the trim vector.
-- **Open-loop deflection is the wrong model.** Aileron commands roll rate, so any sustained net aileron integrates bank without bound — a fixed "hold aileron for the turn" schedule spirals rather than settling into a shallow turn. → closed-loop attitude-hold with rate damping is load-bearing, not a "soft bias."
-- **The Camel is materially harder.** A stabilised, coordinated, trim-aware controller flew c172x and pa28 solidly (bank held at target, altitude within ~50 m over 90 s) but still spiralled the Camel (bank 81°, speed bled 65 → 35 kt). This does not prove the Camel unflyable — a per-airframe-tuned autopilot with speed protection likely can — but proves a single simple airframe-blind controller does not, hence the endurance gate and the Camel caveat. A missing-property read, incidentally, returns 0 quietly rather than throwing (confirmed in increment 6's review), so the bot's own-state reads are safe across airframes.
+- **Trim-blindness departs every airframe.** JSBSim's trim writes non-zero solutions into `aileron-cmd-norm`/`rudder-cmd-norm` (c172x −0.075/−0.004; Camel +0.102/−0.064; each different) and a different throttle each (c172x 0.792, Camel 0.301). A bot that doesn't know these discards them and departs. With **local physics, the bot knows its own trim exactly** — this failure mode is designed out, not patched over.
+- **Open-loop deflection is the wrong model.** Aileron commands roll rate, so fixed deflection integrates bank without bound. → closed-loop attitude-hold with rate damping is load-bearing; local physics gives it zero-latency, full-rate feedback.
+- **The Camel is materially harder.** A stabilised, coordinated, trim-aware controller flew c172x and pa28 solidly but still spiralled the Camel (bank 81°, 65 → 35 kt). This does not prove the Camel unflyable — local physics plus a per-airframe-tuned controller with speed protection may well fly it — but proves a single simple airframe-blind controller does not, hence the endurance gate and the Camel caveat. (A missing-property read returns 0 quietly rather than throwing — confirmed in increment 6's review — so the bot's own-state reads are safe across airframes.)
