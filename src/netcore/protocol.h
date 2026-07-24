@@ -34,7 +34,10 @@ namespace net {
 // Bumped whenever a message layout below changes; ClientHello/
 // ServerWelcome exchange this so mismatched builds reject cleanly
 // instead of misinterpreting each other's bytes (spec, "Wire protocol").
-constexpr uint8_t kProtocolVersion = 1;
+// Standing rule (docs/increment-6-specification.md, "Wire protocol
+// changes"): any change to a message's wire layout bumps this constant.
+// 2: increment 6 adds ServerWelcome.aircraft_id.
+constexpr uint8_t kProtocolVersion = 2;
 
 // ENet channel assignment (spec, "Messages" table's Channel column).
 constexpr uint8_t kChannelReliable = 0;
@@ -96,6 +99,9 @@ struct ServerWelcome {
     float origin_lat_deg = 0.0f;
     float origin_lon_deg = 0.0f;
     uint16_t snapshot_hz = 0;
+    // Increment 6 (docs/increment-6-specification.md, "Aircraft catalog"):
+    // the server's configured aircraft type - 0=c172x, 1=camel, 2=pa28.
+    uint8_t aircraft_id = 0;
 };
 
 struct ServerReject {

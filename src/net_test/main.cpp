@@ -36,6 +36,7 @@
 // Per spec review M2, all scenario timing is measured from server_tick
 // (carried on every snapshot) and anchored to the reliable
 // ServerWelcome, never to wall-clock or an unreliable first snapshot.
+#include "aircraft_catalog.h"
 #include "interpcore/remote_entity_tracker.h"
 #include "netcore/net_client.h"
 #include "netcore/protocol.h"
@@ -74,6 +75,17 @@ struct Config {
     uint16_t port = 45300;
     std::string serverLog = "server_networked.csv";
     std::string receivedLog = "client_received.csv";
+    // docs/increment-6-specification.md, "Server-authoritative type
+    // selection": --mode prediction's own local FlightSession must trim
+    // the same type the server under test is running (--mode multiclient
+    // and the transport-level modes never construct a FlightSession at
+    // all, so this only matters there).
+    std::string aircraft = "c172x";
+    // --mode aircraft_mismatch only (docs/increment-6-specification.md,
+    // "Server-authoritative type selection" / test plan item 4): the
+    // deliberate override that lets a mismatched client stay connected
+    // instead of the default warn-and-disconnect.
+    bool allowAircraftMismatch = false;
 
     // --mode prediction only (docs/increment-4-specification.md, "Test
     // plan").
@@ -120,6 +132,8 @@ Config parseArgs(int argc, char** argv) {
         else if (arg == "--port") cfg.port = static_cast<uint16_t>(std::atoi(nextVal().c_str()));
         else if (arg == "--server-log") cfg.serverLog = nextVal();
         else if (arg == "--received-log") cfg.receivedLog = nextVal();
+        else if (arg == "--aircraft") cfg.aircraft = nextVal();
+        else if (arg == "--allow-aircraft-mismatch") cfg.allowAircraftMismatch = true;
         else if (arg == "--predicted-log") cfg.predictedLog = nextVal();
         else if (arg == "--ground-truth-log") cfg.groundTruthLog = nextVal();
         else if (arg == "--input-schedule") cfg.inputSchedule = nextVal();
@@ -260,16 +274,18 @@ constexpr float kAltitudeGainThresholdM = 3.0f;
 
 constexpr double kDegToRad = M_PI / 180.0;
 
-bool makeTrimmedSession(inc1::FlightSession& session) {
+bool makeTrimmedSession(inc1::FlightSession& session,
+                        const aircraft::CatalogEntry& entry) {
     std::string error;
-    if (!session.initialize(error)) {
+    if (!session.initialize(error, entry.load_model)) {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return false;
     }
     // Same initial condition as flight_server's own (spec, "Reconstruction
     // gate" premise: identical IC + trim + input schedule => bit-identical
     // replay, Appendix B).
-    session.setInitialCondition(5000.0, 100.0, 0.0, 0.0, 0.0, 0.0);
+    session.setInitialCondition(entry.canonical_alt_ft, entry.canonical_vc_kts,
+                                 0.0, 0.0, 0.0, 0.0);
     if (!session.trim(error)) {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return false;
@@ -613,6 +629,13 @@ int runVersionReject(const Config& cfg) {
 // not flaky). `cfg.inputSchedule="analog"` is test 5's aggressive-analog
 // resilience scenario.
 int runPredictionMode(const Config& cfg) {
+    const aircraft::CatalogEntry* catalogEntry =
+        aircraft::findByToken(cfg.aircraft);
+    if (!catalogEntry) {
+        std::fprintf(stderr, "error: unknown --aircraft '%s'\n",
+                     cfg.aircraft.c_str());
+        return 2;
+    }
     // Resolve caller-relative log paths to absolute *before* chdir'ing:
     // this mode is the first in flight_test_client to construct a
     // FlightSession, and c172x's own <output> block can create a stray
@@ -662,7 +685,7 @@ int runPredictionMode(const Config& cfg) {
     uint8_t myPlayerId = hs.welcome.assigned_player_id;
 
     inc1::FlightSession session;
-    if (!makeTrimmedSession(session)) {
+    if (!makeTrimmedSession(session, *catalogEntry)) {
         client.stop();
         enet_deinitialize();
         return 2;
@@ -915,6 +938,106 @@ int runPredictionMode(const Config& cfg) {
         overall = overall && eventualAgreement;
     }
 
+    return overall ? 0 : 1;
+}
+
+// docs/increment-6-specification.md, "Server-authoritative type selection"
+// / test plan item 4 (review finding M3): connects and handshakes only -
+// no local FlightSession, no prediction - purely exercising the mismatch-
+// detection/disconnect-by-default/override behaviour itself, which is
+// otherwise only reachable via the (Godot, not headlessly automatable)
+// PredictedAircraft node. cfg.aircraft is this client's configured type;
+// cfg.allowAircraftMismatch is the override flag under test.
+int runAircraftMismatchCheck(const Config& cfg) {
+    if (enet_initialize() != 0) {
+        std::fprintf(stderr, "error: enet_initialize failed\n");
+        return 2;
+    }
+    net::NetClient client;
+    std::string error;
+    if (!client.connect(cfg.host, cfg.port, error)) {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        enet_deinitialize();
+        return 2;
+    }
+    if (!waitForConnect(client, 5000)) {
+        std::printf("connect: FAIL\n");
+        enet_deinitialize();
+        return 1;
+    }
+    HandshakeOutcome hs = doHandshake(client, net::kProtocolVersion, 5000);
+    bool handshakeOk = hs.result == HandshakeResult::kWelcome;
+    std::printf("handshake: %s\n", handshakeOk ? "PASS" : "FAIL");
+    if (!handshakeOk) {
+        client.stop();
+        enet_deinitialize();
+        return 1;
+    }
+
+    const aircraft::CatalogEntry* serverEntry =
+        aircraft::findById(hs.welcome.aircraft_id);
+    std::string serverToken =
+        serverEntry ? serverEntry->token
+                    : ("unknown(" + std::to_string(hs.welcome.aircraft_id) + ")");
+    bool mismatched = serverToken != cfg.aircraft;
+    std::printf("configured_aircraft=%s server_aircraft=%s mismatched=%s\n",
+                cfg.aircraft.c_str(), serverToken.c_str(),
+                mismatched ? "yes" : "no");
+
+    bool overall;
+    if (!mismatched) {
+        // "Connect a correctly-matched pair; confirm it proceeds silently."
+        std::printf("proceeds_silently: PASS\n");
+        overall = true;
+        client.send(net::kChannelReliable, net::serializeClientBye(), true);
+        client.flush();
+        client.disconnect();
+        waitForDisconnect(client, 2000);
+    } else if (!cfg.allowAircraftMismatch) {
+        std::fprintf(stderr,
+                      "warning: aircraft-type MISMATCH - this client is "
+                      "configured for '%s', server is running '%s'\n",
+                      cfg.aircraft.c_str(), serverToken.c_str());
+        client.send(net::kChannelReliable, net::serializeClientBye(), true);
+        client.flush();
+        client.disconnect();
+        bool disconnected = waitForDisconnect(client, 3000);
+        std::printf("disconnects_by_default_on_mismatch: %s\n",
+                    disconnected ? "PASS" : "FAIL");
+        overall = disconnected;
+    } else {
+        // Override set: stays connected - confirmed by a short liveness
+        // window (snapshots keep flowing), not the full prediction-quality
+        // gauntlet, which a deliberate mismatch is expected to fail by
+        // design (spec: "corrected hard on essentially every snapshot").
+        bool sawSnapshot = false;
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(2000);
+        while (std::chrono::steady_clock::now() < deadline) {
+            client.poll(10, [&](const ENetEvent& event) {
+                if (event.type != ENET_EVENT_TYPE_RECEIVE) return;
+                net::MessageTag tag;
+                if (net::peekMessageTag(event.packet->data,
+                                        event.packet->dataLength, tag) &&
+                    tag == net::MessageTag::kStateSnapshot) {
+                    sawSnapshot = true;
+                }
+            });
+        }
+        bool stillConnected = client.isConnected();
+        overall = stillConnected && sawSnapshot;
+        std::printf(
+            "stays_connected_with_override: %s (still_connected=%d "
+            "snapshots_flowing=%d)\n",
+            overall ? "PASS" : "FAIL", stillConnected, sawSnapshot);
+        client.send(net::kChannelReliable, net::serializeClientBye(), true);
+        client.flush();
+        client.disconnect();
+        waitForDisconnect(client, 2000);
+    }
+
+    client.stop();
+    enet_deinitialize();
     return overall ? 0 : 1;
 }
 
@@ -1262,6 +1385,8 @@ int main(int argc, char** argv) {
         rc = runMulticlientMode(cfg);
     } else if (cfg.mode == "mtu_regression") {
         rc = runMtuRegressionCheck();
+    } else if (cfg.mode == "aircraft_mismatch") {
+        rc = runAircraftMismatchCheck(cfg);
     } else {
         std::fprintf(stderr, "error: unknown --mode '%s'\n", cfg.mode.c_str());
         return 2;

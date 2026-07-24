@@ -58,9 +58,15 @@ public:
     FlightSession(const FlightSession&) = delete;
     FlightSession& operator=(const FlightSession&) = delete;
 
-    // Sets dt, data paths, loads c172x and disables its built-in output
-    // blocks. Returns false and fills `error` if the model fails to load.
-    bool initialize(std::string& error);
+    // Sets dt, data paths, loads `loadModel` (increment 6: the aircraft
+    // catalog's exact-case JSBSim LoadModel string, e.g. "Camel" - not
+    // necessarily equal to the lowercase user-facing token) and disables
+    // its built-in output blocks. Defaulted to "c172x" so increment 1's
+    // scenarios and predictcore's gate regression test - which are
+    // legitimately c172x-only (docs/increment-6-specification.md,
+    // "Aircraft catalog") - need no change at their call sites. Returns
+    // false and fills `error` if the model fails to load.
+    bool initialize(std::string& error, const std::string& loadModel = "c172x");
 
     // Writes the ic/* properties consumed by RunIC().
     void setInitialCondition(double alt_ft, double vc_kts, double psi_true_deg,

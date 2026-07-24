@@ -25,6 +25,7 @@
 //
 // Exit codes match increments 1-2's convention: 0 clean, 1 a criterion
 // failed (scripted mode only), 2 an init/bind/trim execution error.
+#include "aircraft_catalog.h"
 #include "geo/aircraft_orientation.h"
 #include "netcore/net_server.h"
 #include "netcore/protocol.h"
@@ -65,6 +66,11 @@ struct Config {
     int snapshotHz = 30;
     std::string scenario;  // empty => networked mode
     std::string logName;   // empty => derive from mode/scenario
+    // Increment 6 (docs/increment-6-specification.md, "Server-authoritative
+    // type selection"): fixed for the lifetime of one server process, and
+    // shared by every aircraft it manages (real clients, --stress-aircraft
+    // synthetic aircraft) - a whole-session setting, not per-client.
+    std::string aircraft = "c172x";
     // Increment 5 ("Wire protocol changes" / "Open questions"): real
     // client capacity. Suggested default 8 (up from increment 3-4's
     // hardcoded 4) - the CPU/wire-format headroom comfortably supports
@@ -97,6 +103,8 @@ Config parseArgs(int argc, char** argv) {
             cfg.maxClients = std::atoi(nextVal().c_str());
         } else if (arg == "--stress-aircraft") {
             cfg.stressAircraft = std::atoi(nextVal().c_str());
+        } else if (arg == "--aircraft") {
+            cfg.aircraft = nextVal();
         }
     }
     return cfg;
@@ -208,17 +216,18 @@ void offsetSessionPosition(inc1::FlightSession& session, double eastM,
 // Returns nullptr on failure (init/trim non-convergence - not observed in
 // this project's history for this fixed IC, but handled rather than
 // assumed away).
-std::unique_ptr<inc1::FlightSession> onboardNewAircraft(uint8_t playerId,
-                                                          double originLat,
-                                                          double originLon) {
+std::unique_ptr<inc1::FlightSession> onboardNewAircraft(
+    uint8_t playerId, double originLat, double originLon,
+    const aircraft::CatalogEntry& entry) {
     auto s = std::make_unique<inc1::FlightSession>();
     std::string error;
-    if (!s->initialize(error)) {
+    if (!s->initialize(error, entry.load_model)) {
         std::fprintf(stderr, "error: onboarding init failed: %s\n",
                      error.c_str());
         return nullptr;
     }
-    s->setInitialCondition(5000.0, 100.0, 0.0, 0.0, 0.0, 0.0);
+    s->setInitialCondition(entry.canonical_alt_ft, entry.canonical_vc_kts, 0.0,
+                            0.0, 0.0, 0.0);
     if (!s->trim(error)) {
         std::fprintf(stderr, "error: onboarding trim failed: %s\n",
                      error.c_str());
@@ -234,6 +243,28 @@ std::unique_ptr<inc1::FlightSession> onboardNewAircraft(uint8_t playerId,
 int main(int argc, char** argv) {
     Config config = parseArgs(argc, argv);
     bool scripted = !config.scenario.empty();
+
+    const aircraft::CatalogEntry* catalogEntry =
+        aircraft::findByToken(config.aircraft);
+    if (!catalogEntry) {
+        std::fprintf(stderr,
+                      "error: unknown --aircraft '%s' (expected one of "
+                      "c172x, camel, pa28)\n",
+                      config.aircraft.c_str());
+        return 2;
+    }
+    // docs/increment-6-specification.md, "Aircraft catalog": scripted mode
+    // *is* the c172x ground truth (increment 1's regression scenarios) - a
+    // non-c172x --aircraft combined with --scenario is rejected outright
+    // rather than silently run through c172x-tuned pass thresholds (review
+    // finding m1).
+    if (scripted && config.aircraft != "c172x") {
+        std::fprintf(stderr,
+                      "error: --scenario requires --aircraft c172x (or no "
+                      "--aircraft flag); got '%s'\n",
+                      config.aircraft.c_str());
+        return 2;
+    }
 
     // Increment 1's stray-output-file issue (c172x's own <output> block
     // opens a CSV during LoadModel(), before DisableOutput() runs) applies
@@ -269,11 +300,13 @@ int main(int argc, char** argv) {
     // discarded once its origin is read (networked mode).
     auto originSession = std::make_unique<inc1::FlightSession>();
     std::string error;
-    if (!originSession->initialize(error)) {
+    if (!originSession->initialize(error, catalogEntry->load_model)) {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return 2;
     }
-    originSession->setInitialCondition(5000.0, 100.0, 0.0, 0.0, 0.0, 0.0);
+    originSession->setInitialCondition(catalogEntry->canonical_alt_ft,
+                                        catalogEntry->canonical_vc_kts, 0.0,
+                                        0.0, 0.0, 0.0);
     if (!originSession->trim(error)) {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return 2;
@@ -341,7 +374,8 @@ int main(int argc, char** argv) {
             auto a = std::make_unique<Aircraft>();
             a->kind = AircraftKind::kStress;
             a->playerId = nextStressId++;
-            a->session = onboardNewAircraft(a->playerId, originLat, originLon);
+            a->session = onboardNewAircraft(a->playerId, originLat, originLon,
+                                             *catalogEntry);
             if (!a->session) {
                 std::fprintf(stderr, "error: stress aircraft init/trim failed\n");
                 enet_deinitialize();
@@ -424,7 +458,8 @@ int main(int argc, char** argv) {
                 po.peer = event.peer;
                 po.playerId = pid;
                 po.future = std::async(std::launch::async, onboardNewAircraft,
-                                        pid, originLat, originLon);
+                                        pid, originLat, originLon,
+                                        std::cref(*catalogEntry));
                 pendingOnboards.push_back(std::move(po));
                 break;
             }
@@ -565,7 +600,8 @@ int main(int argc, char** argv) {
                         net::kProtocolVersion, po.playerId,
                         static_cast<float>(originLat),
                         static_cast<float>(originLon),
-                        static_cast<uint16_t>(config.snapshotHz)};
+                        static_cast<uint16_t>(config.snapshotHz),
+                        catalogEntry->aircraft_id};
                     server.send(po.peer, net::kChannelReliable,
                                 net::serializeServerWelcome(welcome), true);
                 } else {

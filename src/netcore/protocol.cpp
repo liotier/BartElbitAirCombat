@@ -145,6 +145,7 @@ ByteBuffer serializeServerWelcome(const ServerWelcome& msg) {
     w.putF32(msg.origin_lat_deg);
     w.putF32(msg.origin_lon_deg);
     w.putU16(msg.snapshot_hz);
+    w.putU8(msg.aircraft_id);
     return w.take();
 }
 
@@ -154,7 +155,7 @@ bool deserializeServerWelcome(const uint8_t* data, size_t len,
     if (!checkTag(r, MessageTag::kServerWelcome)) return false;
     return r.getU8(out.protocol_version) && r.getU8(out.assigned_player_id) &&
            r.getF32(out.origin_lat_deg) && r.getF32(out.origin_lon_deg) &&
-           r.getU16(out.snapshot_hz);
+           r.getU16(out.snapshot_hz) && r.getU8(out.aircraft_id);
 }
 
 ByteBuffer serializeServerReject(const ServerReject& msg) {

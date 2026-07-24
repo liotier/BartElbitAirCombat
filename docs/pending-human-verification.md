@@ -42,6 +42,20 @@ the check.
   exercised and correct end to end; only the visual smoothness judgement
   itself needs a human with a display.
 
+- [ ] **Increment 6 acceptance criterion 10** — fly a Camel- or pa28-
+  configured session in the real Godot client (`./build/flight_server
+  --aircraft camel` or `pa28`, then `./scripts/start_client.sh --aircraft
+  camel`/`pa28`) and confirm it actually looks and feels sane, not just
+  "doesn't crash" — Camel specifically is the airframe most likely to feel
+  marginal, since its climb plateaus near stall under sustained full-aft
+  elevator (docs/increment-6-specification.md Appendix B). What's already
+  been verified by the agent, so this is purely the qualitative judgement:
+  both airframes load and trim via the exact validated catalog IC
+  (`catalog_tests`), fly a full networked session with no NaN/divergence/
+  crash, and pass the same airframe-independent prediction criteria
+  (immediate response, bounded-envelope tracking, forced-desync recovery)
+  as c172x, all exercised automatically in `scripts/run_tests.sh`.
+
 - [ ] **Real joystick/HOTAS input, once implemented** — not built yet (see
   "Not yet scheduled" below). Once it is: confirm a real device's axes map
   sensibly (twist/pedal rudder, throttle slider), that Godot's default SDL

@@ -87,6 +87,7 @@ add_library(flightcore STATIC
     src/test_runner.cpp
     src/logging/csv_logger.cpp
     src/geo/aircraft_orientation.cpp
+    src/aircraft_catalog.cpp
 )
 target_include_directories(flightcore PUBLIC src)
 target_link_libraries(flightcore PUBLIC libJSBSim)
@@ -111,6 +112,15 @@ target_link_libraries(increment1_tests PRIVATE flightcore)
 # F11) or godot-cpp (its own, separately-maintained warning policy).
 target_compile_options(increment1_tests PRIVATE -Wall -Wextra)
 target_compile_options(flightcore PRIVATE -Wall -Wextra)
+
+# Increment 6's standalone load+trim regression test (spec, "Test plan"
+# item 1) - Godot-free, links flightcore only (FlightSession + the
+# aircraft catalog, both part of that library).
+add_executable(catalog_tests
+    src/catalog_regression_test.cpp
+)
+target_link_libraries(catalog_tests PRIVATE flightcore)
+target_compile_options(catalog_tests PRIVATE -Wall -Wextra)
 
 # The Godot GDExtension: FlightAircraft, wrapping FlightSession for use
 # inside Godot's real-time frame loop (increment 2 spec, "FlightAircraft

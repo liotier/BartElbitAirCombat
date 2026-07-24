@@ -54,6 +54,15 @@ jobs:
       # test, ~4s, and four chunking-boundary counts, ~4s each plus
       # ~1.5s server startup for --stress-aircraft) - on the order of 30s
       # added, confirmed to remain inside the existing 20-minute budget.
+      #
+      # increment 6 spec, "Acceptance criteria" #9: adds catalog_tests
+      # (near-instant) plus, per non-c172x airframe (Camel, pa28), an
+      # aircraft_id round-trip check, a ~9s sustained-flight resilience
+      # check, and three ~8s prediction-mode runs (step, forced-on,
+      # forced-off) - roughly 40s each - plus the mismatch/multiclient-
+      # re-run/scripted-guard steps (a few seconds total). On the order
+      # of 90s added, confirmed to remain inside the existing 20-minute
+      # budget.
       - name: Run full test suite
         run: ./scripts/run_tests.sh
 

@@ -15,6 +15,7 @@
 
 #include "predicted_aircraft.h"
 
+#include "aircraft_catalog.h"
 #include "geo/aircraft_orientation.h"
 
 #include <godot_cpp/classes/os.hpp>
@@ -51,6 +52,20 @@ void PredictedAircraft::_bind_methods() {
     ADD_PROPERTY(PropertyInfo(Variant::INT, "server_port"), "set_server_port",
                  "get_server_port");
 
+    ClassDB::bind_method(D_METHOD("set_aircraft_type", "type"),
+                         &PredictedAircraft::setAircraftType);
+    ClassDB::bind_method(D_METHOD("get_aircraft_type"),
+                         &PredictedAircraft::getAircraftType);
+    ADD_PROPERTY(PropertyInfo(Variant::STRING, "aircraft_type"),
+                 "set_aircraft_type", "get_aircraft_type");
+
+    ClassDB::bind_method(D_METHOD("set_allow_aircraft_mismatch", "allow"),
+                         &PredictedAircraft::setAllowAircraftMismatch);
+    ClassDB::bind_method(D_METHOD("get_allow_aircraft_mismatch"),
+                         &PredictedAircraft::getAllowAircraftMismatch);
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "allow_aircraft_mismatch"),
+                 "set_allow_aircraft_mismatch", "get_allow_aircraft_mismatch");
+
     ClassDB::bind_method(D_METHOD("is_connected_to_server"),
                          &PredictedAircraft::isConnectedToServer);
 
@@ -69,10 +84,37 @@ void PredictedAircraft::_bind_methods() {
 }
 
 void PredictedAircraft::_ready() {
-    if (!initialize()) return;
-    // Same trimmed initial condition as increments 1-3's default scene
-    // (5000 ft / 100 kt, level, due north at the origin).
-    setInitialCondition(5000.0f, 100.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    // Increment 6 (docs/increment-6-specification.md, "Server-authoritative
+    // type selection"): AIRCRAFT overrides the Inspector-set aircraft_type
+    // property, exactly like SERVER_HOST/SERVER_PORT below - read first,
+    // since it decides which model this client loads and trims at all, not
+    // just how it connects.
+    OS* os = OS::get_singleton();
+    if (os->has_environment("AIRCRAFT")) {
+        aircraftType_ = os->get_environment("AIRCRAFT");
+    }
+    std::string aircraftToken(aircraftType_.utf8().get_data());
+    const aircraft::CatalogEntry* entry = aircraft::findByToken(aircraftToken);
+    if (!entry) {
+        UtilityFunctions::printerr("PredictedAircraft: unknown aircraft_type '",
+                                   aircraftType_, "'");
+        return;
+    }
+
+    // Bypasses the inherited no-arg FlightAircraft::initialize() (which is
+    // bound to GDScript and stays hardcoded c172x for the base class' own,
+    // still-c172x-only scenes) so this node's LoadModel string can come
+    // from the catalog instead.
+    std::string error;
+    if (!session_.initialize(error, entry->load_model)) {
+        UtilityFunctions::printerr("PredictedAircraft: initialize failed: ",
+                                   error.c_str());
+        return;
+    }
+    initialized_ = true;
+    setInitialCondition(static_cast<float>(entry->canonical_alt_ft),
+                        static_cast<float>(entry->canonical_vc_kts), 0.0f,
+                        0.0f, 0.0f, 0.0f);
     if (!trim()) return;
 
     predicted_ = std::make_unique<predict::PredictedSession>(session_);
@@ -96,16 +138,17 @@ void PredictedAircraft::_ready() {
     // headless_test_driver.gd's TEST_SCENARIO, just read here in C++
     // instead of GDScript since server_host/server_port are already this
     // node's own properties.
-    OS* os = OS::get_singleton();
     if (os->has_environment("SERVER_HOST")) {
         serverHost_ = os->get_environment("SERVER_HOST");
     }
     if (os->has_environment("SERVER_PORT")) {
         serverPort_ = os->get_environment("SERVER_PORT").to_int();
     }
+    if (os->has_environment("ALLOW_AIRCRAFT_MISMATCH")) {
+        allowAircraftMismatch_ = true;
+    }
 
     std::string host(serverHost_.utf8().get_data());
-    std::string error;
     if (!client_.connect(host, static_cast<uint16_t>(serverPort_), error)) {
         UtilityFunctions::printerr("PredictedAircraft: connect failed: ",
                                    error.c_str());
@@ -188,6 +231,17 @@ String PredictedAircraft::getServerHost() const { return serverHost_; }
 void PredictedAircraft::setServerPort(int port) { serverPort_ = port; }
 int PredictedAircraft::getServerPort() const { return serverPort_; }
 
+void PredictedAircraft::setAircraftType(const String& type) {
+    aircraftType_ = type;
+}
+String PredictedAircraft::getAircraftType() const { return aircraftType_; }
+void PredictedAircraft::setAllowAircraftMismatch(bool allow) {
+    allowAircraftMismatch_ = allow;
+}
+bool PredictedAircraft::getAllowAircraftMismatch() const {
+    return allowAircraftMismatch_;
+}
+
 bool PredictedAircraft::isConnectedToServer() const {
     return client_.isConnected();
 }
@@ -209,6 +263,40 @@ void PredictedAircraft::handleEvent(const ENetEvent& event) {
                 refLat_ = welcome.origin_lat_deg;
                 refLon_ = welcome.origin_lon_deg;
                 predicted_->setOrigin(refLat_, refLon_);
+
+                // docs/increment-6-specification.md, "Server-authoritative
+                // type selection" (review finding M3): a mismatched pair
+                // predicts a different airframe's physics from the
+                // server's authoritative state, fighting every
+                // reconciliation - a misconfiguration to surface loudly,
+                // not a degraded-but-usable state to limp along in.
+                const aircraft::CatalogEntry* serverEntry =
+                    aircraft::findById(welcome.aircraft_id);
+                String serverToken = serverEntry
+                                          ? String(serverEntry->token.c_str())
+                                          : String("unknown(") +
+                                                String::num_int64(
+                                                    welcome.aircraft_id) +
+                                                String(")");
+                if (serverToken != aircraftType_) {
+                    UtilityFunctions::printerr(
+                        "PredictedAircraft: aircraft-type MISMATCH - this "
+                        "client is configured for '",
+                        aircraftType_, "', server is running '", serverToken,
+                        "'");
+                    if (!allowAircraftMismatch_) {
+                        UtilityFunctions::printerr(
+                            "PredictedAircraft: disconnecting (mismatched "
+                            "aircraft type). Set allow_aircraft_mismatch / "
+                            "ALLOW_AIRCRAFT_MISMATCH to override.");
+                        client_.send(net::kChannelReliable,
+                                     net::serializeClientBye(), true);
+                        client_.flush();
+                        client_.disconnect();
+                        break;  // never set welcomed_: stay inert
+                    }
+                }
+
                 welcomed_ = true;
                 UtilityFunctions::print(
                     "PredictedAircraft: connected, player_id=",

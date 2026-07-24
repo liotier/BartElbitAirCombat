@@ -34,14 +34,14 @@ FlightSession::FlightSession() : fdm_(std::make_unique<JSBSim::FGFDMExec>()) {}
 
 FlightSession::~FlightSession() = default;
 
-bool FlightSession::initialize(std::string& error) {
+bool FlightSession::initialize(std::string& error, const std::string& loadModel) {
     fdm_->Setdt(kDt);
     fdm_->SetRootDir(SGPath(JSBSIM_ROOT));
     fdm_->SetAircraftPath(SGPath("aircraft"));
     fdm_->SetEnginePath(SGPath("engine"));
     fdm_->SetSystemsPath(SGPath("systems"));
-    if (!fdm_->LoadModel("c172x")) {
-        error = "JSBSim LoadModel(\"c172x\") failed";
+    if (!fdm_->LoadModel(loadModel)) {
+        error = "JSBSim LoadModel(\"" + loadModel + "\") failed";
         return false;
     }
     // The c172x model defines its own CSV/socket output blocks; suppress

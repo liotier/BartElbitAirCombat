@@ -30,10 +30,17 @@
 # fragmentation-threshold regression guard, multi-client correctness
 # (distinct player IDs, no cross-talk, live remote-entity tracking,
 # capacity/slot-reuse), and chunked-StateSnapshot correctness at the
-# chunk-boundary aircraft counts. All pass/fail evaluation happens inside
-# the test binaries or the headless test driver script; this script only
-# configures, builds, fetches Godot, invokes everything, starts/stops the
-# server and relay processes it needs, and relays exit status.
+# chunk-boundary aircraft counts - then the increment-6 multi-airframe
+# phase (docs/increment-6-specification.md, "Test plan"): the standalone
+# catalog load+trim regression test, per-airframe (Camel, pa28)
+# aircraft_id round-trip + sustained flight + the airframe-independent
+# prediction criteria, aircraft-type mismatch behaviour (default
+# disconnect, override, matched-silent), a multiclient re-run under a
+# non-c172x type, and the scripted-mode guard. All pass/fail evaluation
+# happens inside the test binaries or the headless test driver script;
+# this script only configures, builds, fetches Godot, invokes everything,
+# starts/stops the server and relay processes it needs, and relays exit
+# status.
 #
 # Exit codes: 0 all tests passed, 1 a test failed, 2 a required tool is
 # missing, 3 cmake configure failed, 4 the build failed, 5 the increment 1
@@ -135,6 +142,7 @@ FLIGHT_TEST_CLIENT="$BUILD_DIR/flight_test_client"
 NET_RELAY="$BUILD_DIR/net_relay"
 PREDICTCORE_TESTS="$BUILD_DIR/predictcore_tests"
 INTERPCORE_TESTS="$BUILD_DIR/interpcore_tests"
+CATALOG_TESTS="$BUILD_DIR/catalog_tests"
 NET_PORT=45300
 RELAY_PORT=45301
 
@@ -451,9 +459,176 @@ for status in "$INTERPCORE_STATUS" "$MTU_STATUS" "$MULTICLIENT_STATUS" \
   fi
 done
 
+echo "== Running increment 6 multi-airframe tests =="
+trap cleanup_net_procs EXIT
+
+# Step: standalone load+trim regression test (test-plan item 1) - pure
+# JSBSim, no server/client needed. Pins down c172x/Camel/pa28's exact
+# catalog LoadModel string + IC as a regression guard.
+echo "-- catalog load+trim regression (c172x, Camel, pa28) --"
+set +e
+"$CATALOG_TESTS"
+CATALOG_STATUS=$?
+set -e
+
+# Steps: per-airframe pipeline generalisation (test-plan items 2-3) - for
+# each of Camel and pa28: confirm ServerWelcome.aircraft_id round-trips
+# correctly (via --mode aircraft_mismatch's matched-pair path), that the
+# connection flies for a sustained period with no NaN/crash (--mode
+# resilience, airframe-agnostic - it builds no local FlightSession), and
+# the airframe-independent prediction criteria (immediate response,
+# bounded-envelope tracking, forced-desync recovery with its negative
+# control) - the increment's central claim (review finding M1).
+# --skip-eventual-agreement throughout: that check's ground truth
+# (server_pitch_response.csv) is c172x-only (test-plan item 3).
+NET6_PREDICT_STATUS=0
+for ac in camel pa28; do
+  echo "-- aircraft_id round-trip + sustained flight: --aircraft $ac --"
+  "$FLIGHT_SERVER" --aircraft "$ac" --port "$NET_PORT" --snapshot-hz 30 \
+    --log-name "networked_${ac}" &
+  CURRENT_SERVER_PID=$!
+  sleep 1
+
+  set +e
+  "$FLIGHT_TEST_CLIENT" --mode aircraft_mismatch --host 127.0.0.1 --port "$NET_PORT" \
+    --aircraft "$ac"
+  ac_id_status=$?
+  "$FLIGHT_TEST_CLIENT" --mode resilience --host 127.0.0.1 --port "$NET_PORT" \
+    --received-log "$RESULTS_DIR/client_received_${ac}.csv"
+  ac_sustained_status=$?
+  set -e
+  if [ "$ac_id_status" -ne 0 ] || [ "$ac_sustained_status" -ne 0 ]; then
+    NET6_PREDICT_STATUS=1
+  fi
+
+  cleanup_net_procs
+
+  echo "-- prediction (immediate response, bounded envelope): --aircraft $ac --"
+  "$FLIGHT_SERVER" --aircraft "$ac" --port "$NET_PORT" --snapshot-hz 30 \
+    --log-name "networked_${ac}_predict_step" &
+  CURRENT_SERVER_PID=$!
+  sleep 1
+
+  set +e
+  "$FLIGHT_TEST_CLIENT" --mode prediction --host 127.0.0.1 --port "$NET_PORT" \
+    --aircraft "$ac" --input-schedule step --duration-s 8 --skip-eventual-agreement \
+    --predicted-log "$RESULTS_DIR/client_predicted_${ac}_step.csv"
+  ac_step_status=$?
+  set -e
+  if [ "$ac_step_status" -ne 0 ]; then
+    NET6_PREDICT_STATUS=1
+  fi
+
+  cleanup_net_procs
+
+  echo "-- prediction (forced misprediction, reconciliation on): --aircraft $ac --"
+  "$FLIGHT_SERVER" --aircraft "$ac" --port "$NET_PORT" --snapshot-hz 30 \
+    --log-name "networked_${ac}_predict_forced_on" &
+  CURRENT_SERVER_PID=$!
+  sleep 1
+
+  set +e
+  "$FLIGHT_TEST_CLIENT" --mode prediction --host 127.0.0.1 --port "$NET_PORT" \
+    --aircraft "$ac" --duration-s 8 --skip-eventual-agreement \
+    --force-desync --reconciliation on \
+    --predicted-log "$RESULTS_DIR/client_predicted_${ac}_forced_on.csv"
+  ac_forced_on_status=$?
+  set -e
+  if [ "$ac_forced_on_status" -ne 0 ]; then
+    NET6_PREDICT_STATUS=1
+  fi
+
+  cleanup_net_procs
+
+  echo "-- prediction (forced misprediction, reconciliation off - negative control): --aircraft $ac --"
+  "$FLIGHT_SERVER" --aircraft "$ac" --port "$NET_PORT" --snapshot-hz 30 \
+    --log-name "networked_${ac}_predict_forced_off" &
+  CURRENT_SERVER_PID=$!
+  sleep 1
+
+  set +e
+  "$FLIGHT_TEST_CLIENT" --mode prediction --host 127.0.0.1 --port "$NET_PORT" \
+    --aircraft "$ac" --duration-s 8 --skip-eventual-agreement \
+    --force-desync --reconciliation off \
+    --predicted-log "$RESULTS_DIR/client_predicted_${ac}_forced_off.csv"
+  ac_forced_off_status=$?
+  set -e
+  if [ "$ac_forced_off_status" -ne 0 ]; then
+    NET6_PREDICT_STATUS=1
+  fi
+
+  cleanup_net_procs
+done
+
+# Step: mismatch behaviour (test-plan item 4, review finding M3) - a
+# --aircraft camel server, tried against a mismatched (pa28-configured,
+# then pa28-configured-with-override) client and a matched (camel-
+# configured) one.
+echo "-- aircraft-type mismatch: warn+disconnect by default, override, matched-silent --"
+"$FLIGHT_SERVER" --aircraft camel --port "$NET_PORT" --snapshot-hz 30 \
+  --log-name networked_mismatch &
+CURRENT_SERVER_PID=$!
+sleep 1
+
+set +e
+"$FLIGHT_TEST_CLIENT" --mode aircraft_mismatch --host 127.0.0.1 --port "$NET_PORT" \
+  --aircraft pa28
+MISMATCH_DEFAULT_STATUS=$?
+"$FLIGHT_TEST_CLIENT" --mode aircraft_mismatch --host 127.0.0.1 --port "$NET_PORT" \
+  --aircraft pa28 --allow-aircraft-mismatch
+MISMATCH_OVERRIDE_STATUS=$?
+"$FLIGHT_TEST_CLIENT" --mode aircraft_mismatch --host 127.0.0.1 --port "$NET_PORT" \
+  --aircraft camel
+MISMATCH_MATCHED_STATUS=$?
+set -e
+
+cleanup_net_procs
+
+# Step: increment 5's multiclient test, re-run with --aircraft camel
+# (test-plan item 5) - confirms the airframe choice is orthogonal to
+# everything increment 5 built, not merely individually compatible.
+echo "-- multiclient re-run: --aircraft camel --"
+"$FLIGHT_SERVER" --aircraft camel --port "$NET_PORT" --snapshot-hz 30 --max-clients 3 \
+  --log-name networked_multiclient_camel &
+CURRENT_SERVER_PID=$!
+sleep 1
+
+set +e
+"$FLIGHT_TEST_CLIENT" --mode multiclient --host 127.0.0.1 --port "$NET_PORT" \
+  --aircraft camel --num-clients 3 --test-capacity
+MULTICLIENT_CAMEL_STATUS=$?
+set -e
+
+cleanup_net_procs
+trap - EXIT
+
+# Step: scripted-mode guard (test-plan item 6, review finding m1) - a
+# non-c172x --aircraft combined with --scenario must be rejected at
+# startup, not silently run through c172x-tuned pass thresholds.
+echo "-- scripted-mode guard: --aircraft camel --scenario pitch_response is rejected --"
+set +e
+"$FLIGHT_SERVER" --aircraft camel --scenario pitch_response
+GUARD_EXIT=$?
+set -e
+if [ "$GUARD_EXIT" -eq 0 ]; then
+  echo "error: --aircraft camel --scenario pitch_response should have been rejected but exited 0" >&2
+  GUARD_STATUS=1
+else
+  GUARD_STATUS=0
+fi
+
+NET6_OVERALL_STATUS=0
+for status in "$CATALOG_STATUS" "$NET6_PREDICT_STATUS" "$MISMATCH_DEFAULT_STATUS" \
+              "$MISMATCH_OVERRIDE_STATUS" "$MISMATCH_MATCHED_STATUS" \
+              "$MULTICLIENT_CAMEL_STATUS" "$GUARD_STATUS"; do
+  if [ "$status" -ne 0 ]; then
+    NET6_OVERALL_STATUS=1
+  fi
+done
+
 if [ "$BINARY_STATUS" -ne 0 ] || [ "$GODOT_OVERALL_STATUS" -ne 0 ] || \
    [ "$NET3_OVERALL_STATUS" -ne 0 ] || [ "$NET4_OVERALL_STATUS" -ne 0 ] || \
-   [ "$NET5_OVERALL_STATUS" -ne 0 ]; then
+   [ "$NET5_OVERALL_STATUS" -ne 0 ] || [ "$NET6_OVERALL_STATUS" -ne 0 ]; then
   exit 1
 fi
 exit 0

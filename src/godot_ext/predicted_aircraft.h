@@ -67,6 +67,18 @@ public:
     void setServerPort(int port);
     int getServerPort() const;
 
+    // Increment 6 (docs/increment-6-specification.md, "Server-authoritative
+    // type selection"): the aircraft type this client trims locally -
+    // must match the server's own --aircraft for prediction/reconciliation
+    // to make sense (see handleEvent's ServerWelcome case).
+    void setAircraftType(const String& type);
+    String getAircraftType() const;
+    // "Continue flying only if a deliberate override flag is set" - for a
+    // tester who explicitly wants to observe the mismatch behaviour rather
+    // than the default warn-and-disconnect.
+    void setAllowAircraftMismatch(bool allow);
+    bool getAllowAircraftMismatch() const;
+
     bool isConnectedToServer() const;
     int getCorrectionCount() const;
 
@@ -89,6 +101,8 @@ private:
 
     String serverHost_ = "127.0.0.1";
     int serverPort_ = 45300;
+    String aircraftType_ = "c172x";
+    bool allowAircraftMismatch_ = false;
 
     // Constructed in _ready() once trim() has succeeded (session_ exists
     // as soon as the base FlightAircraft subobject does, but there is no
