@@ -721,8 +721,13 @@ trap - EXIT
 # Step: child-process lifecycle, clean (test-plan item 5) - SIGTERM to
 # flight_server terminates every bot child, no orphans. flight_server's
 # own shutdown path blocks until every bot child actually exits before it
-# returns, so no orphan is possible by the time `wait` below unblocks;
-# the brief sleep is only for the OS process table to catch up for `ps`.
+# returns, so no orphan is possible by the time `wait` below unblocks.
+# The sleep afterward isn't for that (already guaranteed) - it's margin
+# for the OS to actually release the just-closed UDP socket before the
+# very next step rebinds the same $NET_PORT (observed failing under load
+# with too little margin here: "enet_host_create failed (port ...)" -
+# every *other* teardown-to-rebind transition in this script already
+# gives itself >=1s, this one originally didn't).
 echo "-- child-process lifecycle: clean SIGTERM, no orphans --"
 "$FLIGHT_SERVER" --max-bots 3 --max-players 0 --port "$NET_PORT" --snapshot-hz 30 \
   --log-name networked_bots_shutdown_clean &
@@ -730,7 +735,7 @@ CLEAN_SERVER_PID=$!
 sleep 2
 kill -TERM "$CLEAN_SERVER_PID" || true
 wait "$CLEAN_SERVER_PID" 2>/dev/null || true
-sleep 0.3
+sleep 1.5
 if pgrep -f flight_bot >/dev/null 2>&1; then
   echo "error: bot child(ren) survived a clean server shutdown" >&2
   CLEAN_SHUTDOWN_STATUS=1

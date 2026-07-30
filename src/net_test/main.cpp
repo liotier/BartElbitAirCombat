@@ -553,7 +553,15 @@ int runScriptedInputFlow(const Config& cfg, bool strict) {
     client.send(net::kChannelReliable, net::serializeClientBye(), true);
     client.flush();
     client.disconnect();
-    bool disconnected = waitForDisconnect(client, 3000);
+    // strict (fidelity_input, clean link): 3s is generous already. resilience
+    // (through net_relay's loss injection) needs real extra margin - the
+    // disconnect handshake travels over the *same* reliable channel as
+    // everything else, so under --drop-percent 20 it can legitimately need
+    // more than one retransmit round-trip to land, especially compounded by
+    // a busier CI runner's own scheduling jitter (observed flaking at 3s on
+    // a shared GitHub Actions runner - not reproduced locally, consistent
+    // with a runner-load-dependent margin issue rather than a protocol bug).
+    bool disconnected = waitForDisconnect(client, strict ? 3000 : 8000);
     std::printf("clean_disconnect: %s\n", disconnected ? "PASS" : "FAIL");
 
     receivedLog.close();
@@ -1267,7 +1275,17 @@ int runMulticlientMode(const Config& cfg) {
     bool allWelcomed = true;
     std::vector<uint8_t> assignedIds;
     for (auto& c : clients) {
-        HandshakeOutcome hs = doHandshake(c->client, net::kProtocolVersion, 5000);
+        // Increment 7: on a server with bots to displace, a client past
+        // the additive --max-players threshold isn't welcomed until a
+        // bot's *actual* disconnect is processed (finding M1) - SIGTERM,
+        // the bot's own clean-disconnect handshake, the server noticing
+        // the DISCONNECT event, then this client's onboarding. 5s was
+        // fine for the un-displaced (increment 5) case but measured too
+        // tight for that full chain under real CPU contention (observed
+        // flaking locally, not just on a shared CI runner); 15s gives it
+        // real margin without slowing the common (no-displacement) case,
+        // since this is a ceiling, not a fixed wait.
+        HandshakeOutcome hs = doHandshake(c->client, net::kProtocolVersion, 15000);
         if (hs.result != HandshakeResult::kWelcome) {
             allWelcomed = false;
             continue;

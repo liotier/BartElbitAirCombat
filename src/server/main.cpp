@@ -212,6 +212,10 @@ struct PendingOnboard {
     uint8_t playerId = 0;
     bool isBot = false;
     bool cancelled = false;
+    // Paired from pendingBotPids at ClientHello-observation time (isBot
+    // only) - see startOnboarding's own comment for why this must not wait
+    // until the onboarding future below resolves.
+    pid_t botPid = -1;
     std::future<std::unique_ptr<inc1::FlightSession>> future;
 };
 
@@ -508,6 +512,9 @@ int main(int argc, char** argv) {
         int desiredBots = std::clamp(
             config.maxBots + config.maxPlayers - humanCount, 0, config.maxBots);
         int totalBotCount = static_cast<int>(pendingBotPids.size());
+        for (const auto& po : pendingOnboards) {
+            if (po.isBot) ++totalBotCount;
+        }
         int beingDisplacedCount = 0;
         std::vector<Aircraft*> displaceable;
         for (auto& a : aircraft) {
@@ -528,8 +535,20 @@ int main(int argc, char** argv) {
                 displaceable[i]->beingDisplaced = true;
                 kill(displaceable[i]->botPid, SIGTERM);
             }
-        } else if (totalBotCount < desiredBots) {
-            for (int i = 0; i < desiredBots - totalBotCount; ++i) spawnBot();
+        } else if (totalBotCount < desiredBots && pendingBotPids.empty()) {
+            // One at a time, not the full shortfall at once: fork() order
+            // between two sibling bots is not guaranteed to match the
+            // order their connections/ClientHellos actually arrive in
+            // (each one independently races through execl, dynamic
+            // linking, and its own ENet connect handshake) - two
+            // simultaneously in-flight forks would leave pendingBotPids
+            // ambiguous about which real PID belongs to which peer.
+            // Keeping at most one unclaimed fork outstanding makes
+            // startOnboarding's pairing unambiguous by construction; the
+            // rest of the shortfall is picked up by this same call being
+            // repeated every tick (see the call site after the
+            // pendingOnboards flush) once this one is claimed.
+            spawnBot();
         }
     };
 
@@ -564,6 +583,21 @@ int main(int argc, char** argv) {
         po.peer = peer;
         po.playerId = pid;
         po.isBot = isBot;
+        // Pair this bot's real forked PID to its peer right now, at
+        // ClientHello-observation time, rather than later when the
+        // onboarding future below resolves: two sibling bots' async
+        // FlightSession-init calls (onboardNewAircraft) can finish in
+        // either order regardless of fork order, especially under CPU
+        // contention, so matching by future-completion order let a
+        // displacement decision (which Aircraft is marked beingDisplaced)
+        // and the SIGTERM meant to carry it out land on two different
+        // bots - permanently stranding the marked Aircraft, since its
+        // real process was never signalled, and starving every human
+        // waiting behind it.
+        if (isBot && !pendingBotPids.empty()) {
+            po.botPid = pendingBotPids.front();
+            pendingBotPids.pop_front();
+        }
         po.future = std::async(std::launch::async, onboardNewAircraft, pid,
                                 originLat, originLon, std::cref(*catalogEntry));
         pendingOnboards.push_back(std::move(po));
@@ -813,14 +847,7 @@ int main(int argc, char** argv) {
                     a->session = std::move(session);
                     a->peer = po.peer;
                     a->isBot = po.isBot;
-                    if (po.isBot && !pendingBotPids.empty()) {
-                        // Matches this newly-onboarded bot to the oldest
-                        // still-unmatched forked PID (bots are fungible;
-                        // only the count, not the identity, of the pairing
-                        // matters - see pendingBotPids' own comment).
-                        a->botPid = pendingBotPids.front();
-                        pendingBotPids.pop_front();
-                    }
+                    a->botPid = po.botPid;
                     aircraft.push_back(std::move(a));
                     net::ServerWelcome welcome{
                         net::kProtocolVersion, po.playerId,
@@ -838,6 +865,15 @@ int main(int argc, char** argv) {
                 ++i;
             }
         }
+        // A prior reconcileBotCount() call can find a spawn/displacement
+        // need it cannot fully act on yet (e.g. the bots it would displace
+        // are still mid-onboard, not yet in `aircraft`) - nothing else
+        // retries that need once circumstances change, since reconcile is
+        // otherwise only driven by admission/disconnect events. Re-running
+        // it once per tick, right after onboarding completions are
+        // spliced in above, guarantees it eventually converges instead of
+        // leaving a human stranded in waitingHumanPeers indefinitely.
+        if (!scripted) reconcileBotCount();
 
         tickBarrier.arriveAndWait();  // release workers for this tick
         tickBarrier.arriveAndWait();  // wait for them to finish
@@ -958,6 +994,9 @@ int main(int argc, char** argv) {
     // forever (waitForExitOrKill).
     {
         std::vector<pid_t> allBotPids(pendingBotPids.begin(), pendingBotPids.end());
+        for (const auto& po : pendingOnboards) {
+            if (po.isBot) allBotPids.push_back(po.botPid);
+        }
         for (auto& a : aircraft) {
             if (a->kind == AircraftKind::kClient && a->isBot) {
                 allBotPids.push_back(a->botPid);
